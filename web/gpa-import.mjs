@@ -68,6 +68,17 @@ export function readGpaSheet(text) {
   return { rows, columnCount: Math.max(...rows.map((row) => row.length)) };
 }
 
+// Labels describe the sheet layout only; source values stay in the local preview.
+export function gpaColumnChoices(sheet, headerRow = 1) {
+  const headers = headerRow > 0 ? sheet.rows[headerRow - 1] || [] : [];
+  return Array.from({ length: sheet.columnCount }, (_, index) => {
+    let letter = "";
+    for (let value = index + 1; value > 0; value = Math.floor((value - 1) / 26))
+      letter = String.fromCharCode(65 + (value - 1) % 26) + letter;
+    return { value: index, label: `Column ${letter} · ${clean(headers[index]).slice(0, 80) || "No header"}` };
+  });
+}
+
 export function detectGpaMapping(sheet, headerRow = 1) {
   const headers = (sheet.rows[headerRow - 1] || []).map(headerKey);
   const columns = {

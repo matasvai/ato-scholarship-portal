@@ -68,14 +68,14 @@ test('incorrect current password remains editable and a stale callback cannot cl
   assert.equal(stale.context.user.id,'different-member');
 });
 
-test('MFA and recovery requests redact entire payloads and retain explicit pre-auth CSRF headers', async () => {
+test('sign-in and recovery requests redact entire payloads and retain explicit CSRF headers', async () => {
   const requests = [], context = {
     AbortController, setTimeout, clearTimeout,
     sessionEpoch:1,user:undefined,csrfToken:null,logs:[],performance:{now:() => 1},
-    fetch:async (path, options) => {requests.push(options); return {ok:true,status:200,json:async () => ({mfa:{qrCode:'fictional-private-qr',secret:'fictional-secret'}, recoveryKey:'fictional-words'})};},
+    fetch:async (path, options) => {requests.push(options); return {ok:true,status:200,json:async () => ({accessToken:'fictional-private-token', recoveryKey:'fictional-words'})};},
   };
   const api = runInNewContext(`${redactSource}\n(${apiSource})`,context);
-  for (const path of ['/api/auth/login','/api/auth/mfa/verify','/api/account/recovery-key/confirm']) {
+  for (const path of ['/api/auth/login','/api/auth/complete','/api/account/recovery-key/confirm']) {
     await api(path,{method:'POST',body:{code:'123456',currentPassword:'fictional-password'},headers:{'X-CSRF-Token':'preauth-csrf'}});
   }
   assert.ok(requests.every(request => request.headers['X-CSRF-Token'] === 'preauth-csrf'));
@@ -185,7 +185,7 @@ test('API timeout also covers a stalled response body and clears its timer', asy
     bodyStarted.resolve();
     return new Promise((resolve,reject) => signal.addEventListener('abort',() => reject(signal.reason),{once:true}));
   }}));
-  const pending = f.api('/api/auth/mfa');
+  const pending = f.api('/api/session');
   await bodyStarted.promise;
   f.timers[0].callback();
   await assert.rejects(pending,/request timed out/);

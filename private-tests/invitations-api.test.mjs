@@ -6,7 +6,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { completeChairMfa, responseCookies } from "./chair-mfa-helper.mjs";
+import { responseCookies } from "./auth-test-helper.mjs";
 
 test("Chair invitation API repairs interrupted setup without mail, protects resend, and preserves roster decisions", async t => {
   const root = resolve(import.meta.dirname, ".."), origin = "https://portal.example.test";
@@ -23,7 +23,7 @@ test("Chair invitation API repairs interrupted setup without mail, protects rese
       SUPABASE_SECRET_KEY: `sb_secret_${"b".repeat(32)}`, SUPABASE_STORAGE_BUCKET: "",
       TEST_PUBLIC_ROSTER: "true", ROSTER_REQUIRED: "true", ROSTER_SOURCE_MODE: "public_email_csv",
       ROSTER_SHEET_ID: "a".repeat(44), ROSTER_SHEET_GID: "0", ROSTER_SHEET_RANGE: "",
-      ROSTER_SERVICE_ACCOUNT_EMAIL: "", ROSTER_SERVICE_ACCOUNT_PRIVATE_KEY: "", TEST_MFA_PREENROLLED: "",
+      ROSTER_SERVICE_ACCOUNT_EMAIL: "", ROSTER_SERVICE_ACCOUNT_PRIVATE_KEY: "", TEST_AUTH_PREENROLLED: "",
       CHAIR_AUTH_USER_ID: "aab93409-383f-4d8a-b443-3d940a277153", CHAIR_ACCOUNT_EMAIL: "chair@example.edu", CHAPTER_EMAIL_READY: "true",
     }, stdio: ["ignore", "pipe", "pipe"],
   });
@@ -50,10 +50,8 @@ test("Chair invitation API repairs interrupted setup without mail, protects rese
   };
   const routes = "/api/admin/invitations/member%40example.edu";
   assert.equal((await request("/api/admin/invitations")).status, 401);
-  const pending = await request("/api/auth/login", { identifier: "chair@example.edu", password: "correct-test-password" });
-  assert.equal(pending.payload.mfaRequired, true);
-  assert.equal((await request("/api/admin/invitations", undefined, pending.cookie)).status, 401);
-  const chair = await completeChairMfa(request, pending);
+  const chair = await request("/api/auth/login", { identifier: "chair@example.edu", password: "correct-test-password" });
+  assert.equal(chair.payload.mfaRequired, undefined);
   assert.equal(chair.status, 200, JSON.stringify(chair.payload));
   const chairRequest = (path, body) => request(path, body, chair.cookie, chair.payload.csrfToken);
   assert.equal((await chairRequest("/api/admin/roster-sync", {})).status, 200);

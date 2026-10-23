@@ -998,7 +998,7 @@ async function handleAction(e) {
     openModal(
       "YOUR ACCOUNT",
       esc(user.name),
-      `<p>${esc(user.email || "")}</p><p>${user.role === "chair" ? "Scholarship Chair office account" : "Chapter member"}</p>${user.role === "chair" && appConfig.chapterAuth?.enabled ? `<p class="muted">${appConfig.chapterAuth.emailReady ? "At a Chair transition, ask the portal operator to transfer the office password and authenticator and end the outgoing Chair’s access." : "The chapter inbox is not connected for password resets yet. Contact the portal administrator if this office account needs recovery."}</p>` : ""}<div class="modal-actions"><button class="button ghost" data-action="logout">Sign out</button><button class="button gold" data-action="close">Close</button></div>`,
+      `<p>${esc(user.email || "")}</p><p>${user.role === "chair" ? "Scholarship Chair office account" : "Chapter member"}</p>${user.role === "chair" && appConfig.chapterAuth?.enabled ? `<p class="muted">${appConfig.chapterAuth.emailReady ? "At a Chair transition, ask the portal operator to update the office password and end the outgoing Chair’s access." : "The chapter inbox is not connected for password resets yet. Contact the portal administrator if this office account needs recovery."}</p>` : ""}<div class="modal-actions"><button class="button ghost" data-action="logout">Sign out</button><button class="button gold" data-action="close">Close</button></div>`,
     );
     return;
   }
@@ -1112,10 +1112,6 @@ async function init(sessionFromLogin = null) {
       const e = sessionOutcome.error;
       if (e.status !== 401) throw e;
       if (!isDemo()) {
-        if (appConfig.chapterAuth?.enabled) {
-          try { const pending = await api('/api/auth/mfa'); await chairMfaPage(pending); return; }
-          catch (error) { if (error.status !== 401) throw error; }
-        }
         loginPage();
         return;
       }
@@ -1200,17 +1196,6 @@ async function init(sessionFromLogin = null) {
     $("#retry").onclick = () => init();
   }
 }
-async function chairMfaPage(initial) {
-  loginPage();
-  const epoch = sessionEpoch;
-  main.innerHTML = heading('', 'Chair verification', '') + `<section class="panel login-panel">${loading('Loading verification…', true)}</section>`;
-  const container = main.querySelector('.login-panel');
-  const {mountChairMfa} = await import('/chair-mfa-ui.mjs');
-  if (epoch !== sessionEpoch || !container.isConnected) return;
-  await mountChairMfa(container, {api, esc, initial, loadingMarkup:loading,
-    onComplete: result => epoch === sessionEpoch ? init(result) : undefined,
-    onCancel: () => epoch === sessionEpoch ? loginPage() : undefined});
-}
 function loginPage() {
   document.body.classList.remove("portal-loading");
   setAuthLoading(false);
@@ -1254,8 +1239,7 @@ function loginPage() {
           return;
         }
         const signedIn = await api("/api/auth/login", { method: "POST", body: values });
-        if (signedIn.mfaRequired) await chairMfaPage(signedIn);
-        else await init(signedIn);
+        await init(signedIn);
       } catch (error) {
         setAuthLoading(false);
         if (!$("#form-error")) loginPage();
@@ -1344,18 +1328,8 @@ function accountSetupPage() {
     setupPending = true;
     setAuthLoading(true, "Saving your password…");
     try {
-      const result = await api("/api/auth/complete", { method: "POST", body: { accessToken: accountToken, password: values.password, ...(values.code ? {code:values.code} : {}) } });
+      await api("/api/auth/complete", { method: "POST", body: { accessToken: accountToken, password: values.password } });
       setAuthLoading(false);
-      if (result.mfaRequired) {
-        const form = $('#account-setup');
-        if (!form.elements.code) {
-          form.querySelector('#form-error').insertAdjacentHTML('beforebegin', '<div class="field"><label for="reset-mfa-code">Chair authenticator code</label><input id="reset-mfa-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" minlength="6" maxlength="6" required><small>Enter the current six-digit code from the Chair authenticator. If you have lost it, contact the portal operator for office-account recovery.</small></div>');
-        }
-        form.querySelector('button[type="submit"]').textContent = 'Verify and save password';
-        $('#form-error').textContent = 'Verify the Chair account before changing its password.';
-        form.elements.code.focus();
-        return;
-      }
       accountToken = null;
       history.replaceState(null, "", "/");
       const continueToLogin = () => {
@@ -1961,19 +1935,14 @@ async function openTierImport() {
       api("/api/admin/tier-import"), import("/gpa-import.mjs"),
     ]);
     if (!current()) return;
-    const { readGpaSheet, detectGpaMapping, mapGpaSheet, suggestTarget, nameKey, reviewedTierAssignments } = helpers;
+    const { readGpaSheet, gpaColumnChoices, detectGpaMapping, mapGpaSheet, suggestTarget, nameKey, reviewedTierAssignments } = helpers;
     targets = view.targets.filter((entry) => entry.accountStatus !== "inactive");
     const targetByEmail = new Map(targets.map((entry) => [entry.email, entry]));
-    const fields = [["first", "First name"], ["last", "Last name"], ["full", "Full name"],
-      ["schoolId", "900 number (optional)"], ["gpa", "Previous-semester GPA"], ["email", "Email (optional)"]];
-    const letter = (index) => {
-      let result = "";
-      for (let value = index + 1; value > 0; value = Math.floor((value - 1) / 26))
-        result = String.fromCharCode(65 + (value - 1) % 26) + result;
-      return result;
-    };
+    const fields = [["gpa", "GPA column"], ["schoolId", "900 number column"],
+      ["first", "First name"], ["last", "Last name"], ["full", "Full name"], ["email", "Email (optional)"]];
+    const columnField = ([key, label]) => `<div class="field" data-gpa-field="${key}"><label for="gpa-column-${key}">${label}</label><select id="gpa-column-${key}"${["gpa", "schoolId"].includes(key) ? ` aria-describedby="gpa-column-${key}-hint"` : ""}></select>${["gpa", "schoolId"].includes(key) ? `<small id="gpa-column-${key}-hint"></small>` : ""}</div>`;
     openModal("IMPORT GPA TIERS", "Choose the sheet layout, preview the results, then apply",
-      `<p class="footnote">Choose a CSV export from the GPA sheet. GPA and 900 numbers stay in this import session; only the reviewed tiers are saved.</p><div class="field"><label for="gpa-csv">GPA sheet CSV</label><input id="gpa-csv" type="file" accept=".csv,text/csv"><small>Google Sheets: File → Download → Comma-separated values (.csv).</small></div><section id="gpa-layout" class="import-layout" hidden><h3>SHEET LAYOUT</h3><div class="form-grid"><div class="field"><label for="gpa-header-row">Header row</label><input id="gpa-header-row" type="number" min="0" max="1000" value="1"><small>Use 0 if the sheet has no header.</small></div><div class="field"><label for="gpa-first-row">First member row</label><input id="gpa-first-row" type="number" min="1" max="1100" value="2"></div><div class="field span2"><label for="gpa-name-mode">Names are stored as</label><select id="gpa-name-mode"><option value="split">Separate first and last names</option><option value="full">One full-name column</option></select></div>${fields.map(([key, label]) => `<div class="field" data-gpa-field="${key}"><label for="gpa-column-${key}">${label}</label><select id="gpa-column-${key}"></select></div>`).join("")}</div><div id="gpa-layout-sample" class="import-layout-sample"></div><div class="heading-actions"><button class="button ghost small" id="detect-gpa-columns" type="button">Match header names</button><button class="button ghost small" id="save-gpa-layout" type="button">Save layout for next time</button><button class="button gold small" id="preview-gpa-tiers" type="button">Preview tiers</button></div></section><div id="gpa-import-preview"></div><p id="gpa-import-status" role="status"></p><label id="gpa-confirm-label" class="recovery-confirm" hidden><input type="checkbox" id="gpa-confirm"> I checked the member matches and proposed tiers.</label><div id="form-error" role="alert"></div><div class="modal-actions"><button class="button ghost" type="button" data-action="close">Cancel</button><button class="button gold" type="button" id="apply-gpa-tiers" disabled>Apply reviewed tiers</button></div>`);
+      `<p class="footnote">Choose a CSV export from the GPA sheet. GPA and 900 numbers stay in this import session; only the reviewed tiers are saved.</p><div class="field"><label for="gpa-csv">GPA sheet CSV</label><input id="gpa-csv" type="file" accept=".csv,text/csv"><small>Google Sheets: File → Download → Comma-separated values (.csv).</small></div><section id="gpa-layout" class="import-layout" hidden><h3>CHOOSE COLUMNS</h3><p class="footnote">Select the GPA and 900 number columns using their spreadsheet letters or header names.</p><div class="form-grid">${fields.slice(0, 2).map(columnField).join("")}<div class="field"><label for="gpa-header-row">Header row</label><input id="gpa-header-row" type="number" min="0" max="1000" value="1"><small>Use 0 if the sheet has no header.</small></div><div class="field"><label for="gpa-first-row">First member row</label><input id="gpa-first-row" type="number" min="1" max="1100" value="2"></div><div class="field span2"><label for="gpa-name-mode">Names are stored as</label><select id="gpa-name-mode"><option value="split">Separate first and last names</option><option value="full">One full-name column</option></select></div>${fields.slice(2).map(columnField).join("")}</div><div id="gpa-layout-sample" class="import-layout-sample"></div><div class="heading-actions"><button class="button ghost small" id="detect-gpa-columns" type="button">Match header names</button><button class="button ghost small" id="save-gpa-layout" type="button">Save layout for next time</button><button class="button gold small" id="preview-gpa-tiers" type="button">Preview tiers</button></div></section><div id="gpa-import-preview"></div><p id="gpa-import-status" role="status"></p><label id="gpa-confirm-label" class="recovery-confirm" hidden><input type="checkbox" id="gpa-confirm"> I checked the member matches and proposed tiers.</label><div id="form-error" role="alert"></div><div class="modal-actions"><button class="button ghost" type="button" data-action="close">Cancel</button><button class="button gold" type="button" id="apply-gpa-tiers" disabled>Apply reviewed tiers</button></div>`);
     const layout = $("#gpa-layout"), preview = $("#gpa-import-preview"), statusLine = $("#gpa-import-status"),
       apply = $("#apply-gpa-tiers"), fileInput = $("#gpa-csv"), confirmed = $("#gpa-confirm");
     const clearError = () => { $("#form-error").textContent = ""; };
@@ -1984,12 +1953,11 @@ async function openTierImport() {
     }
     function updateColumnOptions(columns) {
       const headerRow = Number($("#gpa-header-row").value);
-      const headers = headerRow > 0 ? sheet.rows[headerRow - 1] || [] : [];
+      const choices = gpaColumnChoices(sheet, headerRow);
       for (const [key] of fields) {
         const selector = $("#gpa-column-" + key), selected = columns?.[key] ?? Number(selector.value || -1);
-        selector.innerHTML = '<option value="-1">Not selected</option>' +
-          Array.from({ length: sheet.columnCount }, (_, index) =>
-            `<option value="${index}">${letter(index)}${headers[index] ? ` · ${esc(String(headers[index]).slice(0, 80))}` : ""}</option>`).join("");
+        selector.innerHTML = `<option value="-1">${["schoolId", "email"].includes(key) ? "Not in this sheet" : "Choose a column"}</option>` +
+          choices.map(({ value, label }) => `<option value="${value}">${esc(label)}</option>`).join("");
         selector.value = selected >= 0 && selected < sheet.columnCount ? String(selected) : "-1";
       }
     }
@@ -2006,6 +1974,12 @@ async function openTierImport() {
         $(`[data-gpa-field="${key}"]`).hidden = mapping.nameMode === "full" ? key !== "full" : key === "full";
       const shown = fields.filter(([key]) => (mapping.nameMode === "full" ? !["first", "last"].includes(key) : key !== "full") && mapping.columns[key] >= 0);
       const start = Math.max(0, mapping.firstDataRow - 1);
+      for (const key of ["gpa", "schoolId"]) {
+        const column = mapping.columns[key], sample = sheet.rows[start]?.[column]?.trim();
+        $("#gpa-column-" + key + "-hint").textContent = column < 0 ?
+          key === "gpa" ? "Required. Use the previous-semester GPA." : "Optional. Members can also be matched by name or email." :
+          sample ? `Row ${start + 1}: ${sample}` : `Row ${start + 1} is blank in this column. Check the first member row below.`;
+      }
       $("#gpa-layout-sample").innerHTML = shown.length ?
         `<p class="footnote">Sample from the selected columns</p><div class="table-wrap"><table><thead><tr><th>Row</th>${shown.map(([, label]) => `<th>${label}</th>`).join("")}</tr></thead><tbody>${sheet.rows.slice(start, start + 3).map((cells, index) => `<tr><td>${start + index + 1}</td>${shown.map(([key]) => `<td>${esc(cells[mapping.columns[key]] || "—")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : "";
     }
@@ -2061,7 +2035,7 @@ async function openTierImport() {
         layout.hidden = false;
         showLayout(view.mapping || detectGpaMapping(sheet));
         clearError();
-        statusLine.textContent = `${sheet.rows.length} sheet rows read. Check the layout and preview tiers.`;
+        statusLine.textContent = `${sheet.rows.length} sheet rows read. ${view.mapping ? "Saved column choices loaded; check them for this sheet." : "Choose or check the GPA and 900 number columns."} Preview tiers before applying.`;
       } catch (error) { if (current() && version === fileVersion) { statusLine.textContent = ""; formError(error.message); } }
     };
     layout.onchange = (event) => {

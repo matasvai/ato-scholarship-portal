@@ -2,6 +2,12 @@
 
 This is a working acceptance checklist, not a claim that version 1.0 is approved. Keep member emails, grades, passwords, recovery keys and private backup paths out of this public repository. Record the Chair's real decisions and test-recipient addresses in a chapter-controlled location.
 
+## Password-only Chair login and GPA layout — October 23, 2026
+
+- 202 automated tests passed without failures or skips, including isolated PostgreSQL checks. Authenticator enrollment and challenges were removed at the chapter's request; role checks, password verification, CSRF, rate limits and session revocation remain.
+- A fictional browser session signed in directly as Chair, selected reordered GPA and 900-number columns, rejected a duplicate column mapping, saved the layout and applied the correct tiers to two fictional roster entries. No invitations were prepared or sent. The form had no page-level horizontal overflow at the browser's 533-pixel width; physical mobile-browser acceptance remains outstanding.
+- Provider mocks cover password changes and resets for accounts with and without previously enrolled factors. Real Chair sign-in/reset still requires acceptance testing. The updated recovery-email source must also be installed in Supabase; repository changes do not update the hosted template.
+
 ## Pre-meeting verification — October 11, 2026
 
 - 200 automated tests passed, with no failures or skips, using SQLite and an isolated PostgreSQL instance. Source/deployment-file checks and the production dependency audit passed.
@@ -10,11 +16,11 @@ This is a working acceptance checklist, not a claim that version 1.0 is approved
 - Class-hour API and sandbox checks cover approval, denial, replacements, removals, stale/concurrent reviews, total limits and recalculated pending point estimates. A fictional browser flow verified approval to 3 hours, preserved hours during a removal request, and 0 hours after Chair approval. Class forms fit the 390-pixel layout.
 - File previews retain a centered loading cross through image transfer and decoding, omit displayed filenames and support retry. Delayed/cached images and mobile layout were checked. The in-app browser’s PDF fallback was checked; native inline PDF rendering and physical Safari still require acceptance testing.
 - Invitation and password-reset email templates were installed in Supabase, previewed, and verified after reloading the settings. Saving templates sent no emails; recipient inbox delivery remains untested.
-- These checks used local provider mocks. They do not establish hosted email delivery, real authenticator enrollment, physical iPhone behavior, or production backup/restore readiness. Those remain explicit acceptance items below. No real invitation or reset email was sent during this work.
+- These checks used local provider mocks. They do not establish hosted email delivery, real Chair password login/reset, physical iPhone behavior, or production backup/restore readiness. Those remain explicit acceptance items below. No real invitation or reset email was sent during this work.
 
 ## Work that does not require the Chair
 
-- Run the automated suite with an isolated PostgreSQL database as well as local SQLite. Include role/ownership checks, syllabus approval, scoring, stale edits, invitations, password recovery and two-factor verification.
+- Run the automated suite with an isolated PostgreSQL database as well as local SQLite. Include role/ownership checks, syllabus approval, scoring, stale edits, invitations, password recovery and Chair sign-in.
 - Run `node scripts/rehearse-operations.mjs`. It must report all checks passing and remove its temporary data. It includes actual evidence-file bytes, interrupted deletion, account retention and restoring a backup taken before a wipe.
 - Exercise member and Chair screens with fictional data on a narrow screen. Check native activity/class selection, image/PDF upload and preview, cropping, long file names, keyboard navigation, error/retry states, sign-out and loading indicators. Browser emulation does not prove Safari on a physical iPhone.
 - Prepare and preview the [invite template](../supabase/email-templates/invite.html) and [reset template](../supabase/email-templates/recovery.html). Installing either template is separate from sending an email.
@@ -23,7 +29,7 @@ This is a working acceptance checklist, not a claim that version 1.0 is approved
 
 ## Chair meeting: decisions and access
 
-1. **Account and inbox.** Verify the dedicated Chair office login, chapter control of its inbox, authenticator enrollment and a documented transition/recovery process. The previous officeholder's access must end at handoff. Never share the password or authenticator setup code in a meeting note or chat.
+1. **Account and inbox.** Verify the dedicated Chair office login, chapter control of its inbox, password reset and a documented transition/recovery process. The previous officeholder's access must end at handoff. Never share the password in a meeting note or chat.
 2. **Semester.** Confirm semester name, start date, three checkpoint dates, final point deadline and submission closing date. Preview all dates in the portal before saving; do not use semester reset merely to adjust a deadline if real records should remain.
 3. **Roster.** Refresh the read-only sheet, confirm active and new members, detect duplicates/mistyped emails, and review deactivated access. Refreshing the roster does not send invitations.
 4. **Tiers and credits.** The Chair imports their private GPA CSV, maps its rows/columns, reviews matches and resulting tiers, and applies them. Use the page 5 policy. The portal stores tiers rather than the source GPA sheet or 900 numbers. Members submit credit hours with each class syllabus, and the Chair approves both in **Classes**. Check all classes before reviewing point claims: the first class-hours approval replaces any old manually entered total with the sum of approved classes. Confirm any points earned before rollout.

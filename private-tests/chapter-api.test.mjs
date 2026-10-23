@@ -1,4 +1,4 @@
-import { completeChairMfa, responseCookies } from "./chair-mfa-helper.mjs";
+import { responseCookies } from "./auth-test-helper.mjs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -94,9 +94,9 @@ test("chapter accounts bind aliases, restrict chair actions and stop deactivated
     assert.match(await demoScript.text(), /selectedDemoAccount/);
     assert.equal((await fetch(base + "/demo/demo-worker.js")).status, 200);
     assert.equal((await request("/auth/microsoft")).status, 404);
-    const chair = await completeChairMfa(request, await request("/api/auth/login", {
+    const chair = await request("/api/auth/login", {
       identifier: "chair@example.edu", password: "correct-test-password",
-    }));
+    });
     assert.equal(chair.status, 200, JSON.stringify(chair.payload));
     assert.equal(chair.payload.user.role, "chair");
     assert.equal(chair.payload.user.name, "Scholarship Chair Office");
@@ -315,7 +315,7 @@ test("chapter accounts bind aliases, restrict chair actions and stop deactivated
       identifier: "1234", password: "correct-test-password",
     })).status, 401);
     const chairSetup = await request("/api/auth/complete", {
-      accessToken: "test-chair-account-token", password: "a-new-chair-password", code: "123456",
+      accessToken: "test-chair-account-token", password: "a-new-chair-password",
     });
     assert.equal(chairSetup.status, 200);
     assert.equal(chairSetup.payload.recoveryKey, undefined);

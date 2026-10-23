@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { detectGpaMapping, mapGpaSheet, parseGpaCsv, readGpaSheet, reviewedTierAssignments, suggestTarget, tierForGpa } from "../web/gpa-import.mjs";
+import { detectGpaMapping, gpaColumnChoices, mapGpaSheet, parseGpaCsv, readGpaSheet, reviewedTierAssignments, suggestTarget, tierForGpa } from "../web/gpa-import.mjs";
 import { validateGpaImportMapping } from "../server/gpa-import-settings.mjs";
 
 test("page-5 GPA boundaries determine tiers without storing a GPA", () => {
@@ -58,6 +58,26 @@ test("no-header and full-name sheets can be mapped manually; ambiguous headers n
   assert.equal(detectGpaMapping(readGpaSheet("Name,GPA,GPA\nA,2.6,3.5")).columns.gpa, -1);
   assert.throws(() => validateGpaImportMapping({ ...mapping, gpa: "2.60" }), /valid sheet/);
   assert.throws(() => validateGpaImportMapping({ ...mapping, columns: { ...mapping.columns, schoolId: "900123456" } }), /valid sheet/);
+});
+
+test("column choices identify blank and duplicate headers by spreadsheet letter", () => {
+  const sheet = readGpaSheet('Report title\nGPA,,GPA,900 Number\n2.69,Sample Member,3.50,900123456\n');
+  assert.deepEqual(gpaColumnChoices(sheet, 2), [
+    { value: 0, label: "Column A · GPA" },
+    { value: 1, label: "Column B · No header" },
+    { value: 2, label: "Column C · GPA" },
+    { value: 3, label: "Column D · 900 Number" },
+  ]);
+  const mapping = { headerRow: 2, firstDataRow: 3, nameMode: "full",
+    columns: { first: -1, last: -1, full: 1, schoolId: 3, gpa: 0, email: -1 } };
+  assert.equal(mapGpaSheet(sheet, mapping)[0].tier, 4);
+  assert.equal(mapGpaSheet(sheet, { ...mapping, columns: { ...mapping.columns, gpa: 2 } })[0].tier, 1);
+  assert.ok(gpaColumnChoices(sheet, 0).every((choice) => choice.label.endsWith("No header")));
+  assert.ok(!JSON.stringify(gpaColumnChoices(sheet, 0)).includes("900123456"), "headerless column labels must not use a member's source values");
+  const wideSheet = readGpaSheet(Array.from({ length: 28 }, (_, index) => `Header ${index}`).join(","));
+  assert.equal(gpaColumnChoices(wideSheet)[25].label, "Column Z · Header 25");
+  assert.equal(gpaColumnChoices(wideSheet)[26].label, "Column AA · Header 26");
+  assert.equal(gpaColumnChoices(wideSheet)[27].label, "Column AB · Header 27");
 });
 
 test("reviewed payload contains tiers only and blocks unresolved, invalid and duplicate selections", () => {

@@ -1623,14 +1623,5 @@ pre {
   }
 }
 
-.chair-mfa-enrollment img {
-  display: block;
-  max-width: 100%;
-  height: auto;
-  background: #fff;
-  margin: 20px 0;
-}
-.chair-mfa-enrollment code { overflow-wrap: anywhere; }
-.chair-mfa-help, .chair-mfa-enrollment details { margin: 16px 0; }
 #invitation-status .table-link { display: block; margin: 6px 0; }
 .recovery-feedback:not(:empty), .invitation-feedback:not(:empty) { margin: 12px 0; }

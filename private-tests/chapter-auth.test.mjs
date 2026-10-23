@@ -86,7 +86,7 @@ test("account link changes a password only for the verified token subject", asyn
   };
   try {
     assert.deepEqual(await userForAccountToken(env, "private-test-token"),
-      { id: userId, email: "member@example.edu" });
+      { id: userId, email: "member@example.edu", hasVerifiedFactors: false });
     assert.deepEqual(await setPasswordWithToken(env, "private-test-token", "a-long-new-password", userId),
       { id: userId, email: "member@example.edu" });
     assert.equal(calls.length, 2);

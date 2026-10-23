@@ -4,10 +4,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase } from '../server/database.mjs';
-import { authMutationVersion, assertAuthMutationVersion } from '../server/chair-mfa.mjs';
+import { authMutationVersion, assertAuthMutationVersion } from '../server/auth-mutation.mjs';
 import { setChairAccess } from '../scripts/chair-access.mjs';
 
-test('operator pause/resume revokes only the exact Chair sessions and pending MFA, invalidates in-flight sign-in, retains records', async () => {
+test('operator pause/resume revokes only the exact Chair sessions and legacy pending sign-ins, invalidates in-flight sign-in, retains records', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'ato-chair-handoff-test-'));
   const db = await openDatabase({ directory, env: {} });
   try {

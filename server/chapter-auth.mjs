@@ -151,7 +151,11 @@ export async function userForAccountToken(env, accessToken) {
   const { data: verified, error: verifyError } =
     await publicClient.auth.getUser(accessToken);
   if (verifyError || !verified?.user?.id) return null;
-  return { id: verified.user.id, email: verified.user.email?.toLowerCase() };
+  return {
+    id: verified.user.id, email: verified.user.email?.toLowerCase(),
+    // Internal-only migration information; never expose factors to the browser.
+    hasVerifiedFactors: (verified.user.factors || []).some(factor => factor.status === "verified"),
+  };
 }
 
 export async function setPasswordWithToken(env, accessToken, password, expectedUserId) {

@@ -1,4 +1,4 @@
-import { CHAIR_MFA_LIFETIME, verifyChairPassword, startChairMfa, pendingChairMfa, chairMfaPayload, verifyChairMfaCode, verifyPasswordResetMfa, markChairMfaSession, assertChairMfaSession, authMutationVersion, assertAuthMutationVersion, beginAuthMutation, finishAuthMutation } from "./chair-mfa.mjs";
+import { authMutationVersion, assertAuthMutationVersion, beginAuthMutation, finishAuthMutation } from "./auth-mutation.mjs";
 import { pilotEligible } from "./pilot-access.mjs";
 import { invitationView, invitationList, runInvitation } from "./invitations.mjs";
 import { pointAdjustmentView, applyPointAdjustment } from "../web/point-adjustment-data.mjs";
@@ -183,7 +183,8 @@ async function academicSnapshot(session, expectedGeneration) {
 }
 const sessionCookie = production ? "__Host-ato_session" : "ato_session";
 const identityCookie = production ? "__Host-ato_identity" : "ato_identity";
-const mfaCookie = production ? "__Host-ato_chair_mfa" : "ato_chair_mfa";
+// Clear the retired pre-authentication cookie when a regular login succeeds.
+const legacyMfaCookie = production ? "__Host-ato_chair_mfa" : "ato_chair_mfa";
 const SESSION_LIFETIME = 8 * 60 * 60 * 1000;
 const sha = (value) => createHash("sha256").update(value).digest("hex");
 const token = () => randomBytes(32).toString("hex");
@@ -224,8 +225,6 @@ async function assertActiveSession(session, user, checkEligibility = true) {
   const currentMember = await member(session.workspace, user.id);
   if (!fresh || !currentMember?.active || currentMember.role !== user.role)
     fail(401, "Your account session is no longer active.");
-  if (production && authMode === "chapter" && currentMember.role === "chair")
-    await assertChairMfaSession(db, session, currentMember.id);
   if (checkEligibility && user.role !== "chair")
     assertRosterEligibility(await stateOf(session.workspace), currentMember);
   return currentMember;
@@ -539,8 +538,6 @@ async function requireSession(req) {
   const user = session && (await member(session.workspace, session.member_id));
   if (!session || !user?.active)
     fail(401, "Sign in to an active chapter account.");
-  if (production && authMode === "chapter" && user.role === "chair" && req.url?.split("?")[0] !== "/api/logout")
-    await assertChairMfaSession(db, session, user.id);
   if (user.role !== "chair" && req.url?.split("?")[0] !== "/api/logout") {
     let state = await stateOf(session.workspace);
     const status = rosterView(state);
@@ -572,7 +569,7 @@ function csrf(req, session) {
       "The security token is missing or expired. Refresh and try again.",
     );
 }
-async function issueSession(workspace, userId, previousId = null, chairMfaVerified = false) {
+async function issueSession(workspace, userId, previousId = null) {
   if (previousId)
     await db.prepare("DELETE FROM sessions WHERE id=?").run(previousId);
   const raw = token();
@@ -586,7 +583,6 @@ async function issueSession(workspace, userId, previousId = null, chairMfaVerifi
   await db
     .prepare("INSERT INTO sessions VALUES (?,?,?,?,?)")
     .run(session.id, workspace, userId, session.csrf, session.expires);
-  if (chairMfaVerified) await markChairMfaSession(db, session, userId);
   return { session, cookie: cookie(sessionCookie, raw) };
 }
 async function cleanup() {
@@ -1083,7 +1079,7 @@ const server = http.createServer(async (req, res) => {
       const isChairLogin = candidate?.role === "chair" || email === bootstrapEmail;
       const bootstrapFenceId = `supabase:${env.CHAIR_AUTH_USER_ID}`;
       const bootstrapVersion = isChairLogin ? await authMutationVersion(db, "chapter", bootstrapFenceId) : null;
-      const verified = await (isChairLogin ? verifyChairPassword : verifyPassword)(env, email, password);
+      const verified = await verifyPassword(env, email, password);
       if (!verified || verified.email !== email)
         fail(401, "Invalid sign-in details.");
       const issued = await atomic(async () => {
@@ -1115,18 +1111,12 @@ const server = http.createServer(async (req, res) => {
           fail(401, "Invalid sign-in details.");
         if (candidate) await assertAuthMutationVersion(db, "chapter", user.id, authVersion);
         if (isChairLogin) await assertAuthMutationVersion(db, "chapter", bootstrapFenceId, bootstrapVersion);
-        if (user.role === "chair") {
-          if (!verified.accessToken) fail(401, "Sign in with the Scholarship Chair office email.");
-          return { user, mfa: await startChairMfa(db, env, verified, user.id) };
-        }
+        // A prior deployment may have left a short-lived pending enrollment.
+        // Retire it locally; existing provider factors are left unchanged.
+        await db.prepare("DELETE FROM transactions WHERE kind='chair_mfa_pending' AND session_id=?").run(user.id);
         await audit("chapter", user.name, "session.login", user.id, "chapter");
         return { ...await issueSession("chapter", user.id, (await currentSession(req))?.id), user };
       });
-      if (issued.mfa) {
-        const oldSession = await currentSession(req);
-        if (oldSession) await db.prepare("DELETE FROM sessions WHERE id=?").run(oldSession.id);
-        return json(res, 200, chairMfaPayload(issued.mfa), { "Set-Cookie": [cookie(sessionCookie, "", 0), cookie(mfaCookie, issued.mfa.raw, CHAIR_MFA_LIFETIME / 1000)] });
-      }
       if (issued.user.role === "member") {
         try {
           let state = await stateOf("chapter");
@@ -1148,48 +1138,10 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200,
         { ...await sessionPayload(issued.session, await member("chapter", issued.session.member_id)),
           ...(issued.recoveryKey ? { recoveryKey: issued.recoveryKey } : {}) },
-        { "Set-Cookie": issued.cookie });
+        { "Set-Cookie": [issued.cookie, cookie(legacyMfaCookie, "", 0)] });
     }
-    if (production && authMode === "chapter" && path.startsWith("/api/auth/mfa")) {
-      if (!["/api/auth/mfa", "/api/auth/mfa/verify", "/api/auth/mfa/cancel"].includes(path)) fail(404, "Endpoint not found.");
-      if (req.method !== "GET" && req.method !== "POST") fail(405, "Method not allowed.");
-      if (req.method === "POST") requireOrigin(req);
-      const input = req.method === "POST" ? await readBody(req) : null;
-      if (path === "/api/auth/mfa/verify" && req.method === "POST") {
-        const attempt = await pendingChairMfa(db, env, getCookie(req, mfaCookie));
-        if (!equal(req.headers["x-csrf-token"], attempt.data.csrf)) fail(403, "Refresh the verification screen and try again.");
-        await authAttempt("chair_mfa_attempt", attempt.data.authUserId, 10);
-      }
-      const result = await atomic(async () => {
-        await lockWorkspace("chapter");
-        const pending = await pendingChairMfa(db, env, getCookie(req, mfaCookie));
-        const user = await member("chapter", pending.data.memberId);
-        const binding = await identityMember("chapter", "supabase", pending.data.authUserId);
-        if (!user?.active || user.role !== "chair" || binding?.member_id !== user.id || user.email !== pending.data.email)
-          fail(401, "The Scholarship Chair account is no longer active.");
-        await authMutationVersion(db, "chapter", user.id);
-        if (req.method === "POST" && !equal(req.headers["x-csrf-token"], pending.data.csrf)) fail(403, "Refresh the verification screen and try again.");
-        if (path === "/api/auth/mfa" && req.method === "GET") return { payload: chairMfaPayload(pending) };
-        if (path === "/api/auth/mfa/cancel" && req.method === "POST") {
-          await db.prepare("DELETE FROM transactions WHERE id=?").run(pending.id);
-          return { cancelled: true };
-        }
-        if (path !== "/api/auth/mfa/verify" || req.method !== "POST") fail(405, "Method not allowed.");
-        // The persistent counter also survives provider failures without logging codes.
-        const checked = await verifyChairMfaCode(db, env, pending, input?.code);
-        if (checked.error) return checked;
-        await db.prepare("DELETE FROM transactions WHERE id=?").run(pending.id);
-        const issued = await issueSession("chapter", user.id, (await currentSession(req))?.id, true);
-        await audit("chapter", user.name, "session.login", user.id, "chapter; authenticator verified");
-        return { issued, user };
-      });
-      if (result.error) fail(result.error.status, result.error.message);
-      if (result.payload) return json(res, 200, result.payload);
-      if (result.cancelled) return json(res, 200, { cancelled: true }, { "Set-Cookie": cookie(mfaCookie, "", 0) });
-      await clearAuthAttempts("login_attempt", result.user.id);
-      await clearAuthAttempts("login_attempt", result.user.email);
-      return json(res, 200, await sessionPayload(result.issued.session, result.user), { "Set-Cookie": [result.issued.cookie, cookie(mfaCookie, "", 0)] });
-    }
+    if (path === "/api/auth/mfa" || path.startsWith("/api/auth/mfa/"))
+      fail(404, "Endpoint not found.");
     if (production && authMode === "chapter" && path === "/api/auth/request-reset" && req.method === "POST") {
       requireOrigin(req);
       if (!chapterAuthConfigured(env) || !chairAccountConfigured(env)) fail(503, "Chapter sign-in is not ready.");
@@ -1279,15 +1231,6 @@ const server = http.createServer(async (req, res) => {
         fail(403, "This account is not approved for the portal.");
       const isConfiguredChair = equal(env.CHAIR_AUTH_USER_ID, account.id) &&
         equal(env.CHAIR_ACCOUNT_EMAIL?.trim().toLowerCase(), account.email);
-      if (input.code !== undefined && input.code !== "") {
-        if (typeof input.code !== "string" || !/^\d{6}$/.test(input.code))
-          fail(422, "Enter the six-digit code from your authenticator.");
-        await authAttempt("chair_mfa_attempt", account.id, 10);
-      }
-      const resetMfa = await verifyPasswordResetMfa(env, input.accessToken, account, input.code);
-      if (resetMfa.mfaRequired) return json(res, 200, {
-        mfaRequired: true, message: "Enter your authenticator code to finish changing the password.",
-      });
       const bootstrapFenceId = `supabase:${env.CHAIR_AUTH_USER_ID}`;
       const mutation = await atomic(async () => {
         await lockWorkspace("chapter");
@@ -1307,7 +1250,12 @@ const server = http.createServer(async (req, res) => {
         return { userId: currentUser?.id, epoch, bootstrapEpoch };
       });
       try {
-        if (!(await setPasswordWithToken(env, resetMfa.accessToken, input.password, account.id))) throw Error('Unconfirmed password update');
+        // A legacy provider factor can prevent an AAL1 recovery token from
+        // updating its own password. The token and exact active portal identity
+        // have already been verified above; update only that identity without
+        // changing its provider factors or granting a portal session.
+        if (account.hasVerifiedFactors) await setPasswordByAdmin(env, account.id, input.password);
+        else if (!(await setPasswordWithToken(env, input.accessToken, input.password, account.id))) throw Error('Unconfirmed password update');
       } catch {
         fail(503, "Password update could not be confirmed. Wait two minutes, then try signing in with your new password or request a new reset link.");
       }
@@ -3132,7 +3080,6 @@ const server = http.createServer(async (req, res) => {
       "/syllabus-data.mjs": "syllabus-data.mjs",
       "/syllabus-ui.mjs": "syllabus-ui.mjs",
       "/file-preview-ui.mjs": "file-preview-ui.mjs",
-      "/chair-mfa-ui.mjs": "chair-mfa-ui.mjs",
       "/profile-ui.mjs": "profile-ui.mjs",
       "/credit-data.mjs": "credit-data.mjs",
       "/credit-ui.mjs": "credit-ui.mjs",

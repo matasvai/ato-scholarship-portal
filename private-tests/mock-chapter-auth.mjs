@@ -1,5 +1,4 @@
-import { writeFile } from "node:fs/promises";
-import { mockChairMfa, mockChairToken, mockChairTokenUser, mockChairTokenAal, mockChairHasVerifiedFactor } from "./mock-chair-mfa.mjs";
+import { appendFile, writeFile } from "node:fs/promises";
 const originalFetch = globalThis.fetch;
 const chairId = "aab93409-383f-4d8a-b443-3d940a277153";
 const memberId = "d4dc3984-9c89-4ff7-8075-cbe5b2cd18c4";
@@ -24,20 +23,21 @@ globalThis.fetch = async (input, options = {}) => {
   }
   if (url.origin !== "https://chapter-test.supabase.co")
     return originalFetch(input, options);
-  const mfaResponse = mockChairMfa(url, options);
-  if (mfaResponse) return mfaResponse;
+  if (process.env.TEST_AUTH_PROVIDER_LOG) await appendFile(process.env.TEST_AUTH_PROVIDER_LOG, `${options.method || 'GET'} ${url.pathname}\n`);
+  // No production route may create, delete, challenge, or verify a factor now.
+  if (url.pathname.startsWith('/auth/v1/factors')) throw Error('Retired authenticator route was called.');
   if (url.pathname === "/auth/v1/token") {
     const body = JSON.parse(options.body);
     const id = body.email === "chair@example.edu" ? chairId :
       body.email === "member@example.edu" ? memberId : null;
     if (!id || body.password !== passwords.get(id))
       return respond({ error: "invalid_grant" }, 400);
-    if (id === chairId && process.env.TEST_MFA_TOKEN_SIGNAL) {
-      await writeFile(process.env.TEST_MFA_TOKEN_SIGNAL, 'password-verified');
+    if (id === chairId && process.env.TEST_AUTH_TOKEN_SIGNAL) {
+      await writeFile(process.env.TEST_AUTH_TOKEN_SIGNAL, 'password-verified');
       await new Promise(resolve => setTimeout(resolve, 250));
     }
     return respond({
-      access_token: id === chairId ? mockChairToken() : "test-access-token", token_type: "bearer",
+      access_token: id === chairId ? "test-chair-password-token" : "test-access-token", token_type: "bearer",
       refresh_token: "test-refresh-token", expires_in: 3600,
       user: { id, email: body.email, email_confirmed_at: "2026-09-29T00:00:00Z" },
     });
@@ -56,15 +56,19 @@ globalThis.fetch = async (input, options = {}) => {
   if (url.pathname === "/auth/v1/recover") return respond({});
   if (url.pathname === "/auth/v1/user") {
     const accessToken = new Headers(options.headers).get('authorization')?.replace(/^Bearer /, '');
-    const chair = mockChairTokenUser(accessToken) === chairId;
+    const chair = ['test-chair-account-token', 'test-chair-password-token'].includes(accessToken);
+    const member = ['test-account-token', 'test-access-token'].includes(accessToken);
+    if (!chair && !member) return respond({ error: 'invalid token' }, 401);
     const id = chair ? chairId : memberId;
+    const factors = chair && process.env.TEST_AUTH_PREENROLLED === 'true'
+      ? [{ id: 'factor-existing', factor_type: 'totp', status: 'verified', friendly_name: 'Scholarship Chair' }] : [];
     if (options.method === "PUT") {
-      if (chair && mockChairHasVerifiedFactor() && mockChairTokenAal(accessToken) !== 'aal2')
+      if (factors.length > 0)
         return respond({ code: 'insufficient_aal', message: 'AAL2 is required to update password when MFA is enabled.' }, 401);
       passwords.set(id, JSON.parse(options.body).password);
     }
     return respond(chair
-      ? { id: chairId, email: "chair@example.edu" }
+      ? { id: chairId, email: "chair@example.edu", factors }
       : { id: memberId, email: "member@example.edu" });
   }
   if (url.pathname.startsWith("/auth/v1/admin/users/") && options.method === "PUT") {
