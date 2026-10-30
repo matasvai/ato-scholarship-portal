@@ -85,6 +85,22 @@ test("unexpected invited user id is treated as an ambiguous send, never rebound"
   await assert.rejects(sendInvitationAccount(env, { id, email, confirmed: false }, "https://portal.example.test/account/setup"), /could not be confirmed/);
 });
 
+test("only a recognized Auth429 is a proven email rejection; other provider failures remain ambiguous", async t => {
+  const fetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = fetch; });
+  const account = { id, email, confirmed: false };
+  for (const code of ["over_email_send_rate_limit", "over_request_rate_limit"]) {
+    globalThis.fetch = async () => reply({ error_code: code, msg: "Private provider diagnostic" }, 429);
+    await assert.rejects(sendInvitationAccount(env, account, "https://portal.example.test/account/setup"), error =>
+      error.status === 429 && error.emailNotAccepted === true && /one hour/.test(error.message) && !error.message.includes("Private"));
+  }
+  for (const [status, code] of [[503, "over_email_send_rate_limit"], [500, "smtp_error"], [429, "unexpected_code"], [400, "over_email_send_rate_limit"]]) {
+    globalThis.fetch = async () => reply({ error_code: code, msg: "Private provider diagnostic" }, status);
+    await assert.rejects(sendInvitationAccount(env, account, "https://portal.example.test/account/setup"), error =>
+      error.emailNotAccepted === undefined && error.status === undefined && /could not be confirmed/.test(error.message));
+  }
+});
+
 test("ordinary password verification and updates also receive a bounded provider signal", async t => {
   const fetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = fetch; });

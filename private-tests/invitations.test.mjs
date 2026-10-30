@@ -80,6 +80,7 @@ test("prepare creates one durable account without email and only explicit send c
   const prepared = await f.run("prepare");
   assert.equal(prepared.invitation.status, "ready");
   assert.equal(prepared.invitation.canResend, true);
+  assert.equal(prepared.invitation.canSendInitial, true);
   assert.equal(f.calls.sends, 0);
   assert.equal((await f.run("prepare")).memberId, prepared.memberId);
   assert.equal((await f.run("create")).memberId, prepared.memberId, "legacy create cannot accidentally email a saved account");
@@ -90,6 +91,173 @@ test("prepare creates one durable account without email and only explicit send c
   assert.equal(f.calls.sends, 1);
   await f.storage.prepare("UPDATE members SET active=0 WHERE id=?").run(prepared.memberId);
   await assert.rejects(f.run("prepare"), error => error.status === 409);
+});
+
+test("initial-email eligibility excludes prior attempts, uncertain results, and busy or unprepared accounts", () => {
+  const ready = { email: "member@example.edu", name: "Member", bound: true, status: "ready" };
+  assert.equal(invitationView(ready, 100).canSendInitial, true);
+  for (const changes of [
+    { bound: false }, { initialEmailEligible: false }, { status: "sent" }, { status: "delivery_unknown" },
+    { status: "failed" }, { status: "preparing" }, { status: "sending" },
+    { lastAttemptAt: "2026-10-01T00:00:00Z" }, { lastSentAt: "2026-10-01T00:00:00Z" },
+    { operation: { until: 101 } }, { retryAt: 101 },
+  ]) assert.equal(invitationView({ ...ready, ...changes }, 100).canSendInitial, false, JSON.stringify(changes));
+});
+
+test("initial send requires a prepared account and replays cannot send another email", async t => {
+  const f = await fixture(t);
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  assert.deepEqual(f.calls, { creates: 0, sends: 0, finds: 0 });
+  const prepared = await f.run("prepare");
+  assert.equal(prepared.invitation.canSendInitial, true);
+  const sent = await f.run("send-initial");
+  assert.equal(sent.invitation.status, "sent");
+  assert.equal(sent.invitation.canSendInitial, false);
+  assert.equal(f.calls.sends, 1);
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  f.advance(60_001);
+  await f.run("reconcile");
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  assert.equal(f.calls.sends, 1);
+  assert.equal(f.calls.creates, 1);
+});
+
+test("concurrent initial email and explicit resend cannot cross the same send boundary twice", async t => {
+  const f = await fixture(t);
+  await f.run("prepare");
+  const find = f.provider.find;
+  let release, started;
+  const reached = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  f.provider.find = async email => { started(); await gate; return find(email); };
+  const first = f.run("send-initial");
+  await reached;
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  await assert.rejects(f.run("resend"), error => error.status === 409);
+  release();
+  await first;
+  assert.equal(f.calls.sends, 1);
+});
+
+test("an uncertain initial send stays excluded even after reconciliation and cooldown", async t => {
+  const f = await fixture(t);
+  await f.run("prepare");
+  const send = f.provider.send;
+  f.provider.send = async account => { await send(account); throw Error("accepted, response lost"); };
+  await assert.rejects(f.run("send-initial"), error => error.status === 503);
+  assert.equal((await f.state()).invitations[f.input.email].status, "delivery_unknown");
+  f.advance(90_001);
+  const checked = await f.run("reconcile");
+  assert.equal(checked.invitation.canSendInitial, false);
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  assert.equal(f.calls.sends, 1);
+});
+
+test("a proven email-limit rejection permits only a later manually selected retry", async t => {
+  const f = await fixture(t);
+  await f.run("prepare");
+  let attempts = 0;
+  const send = f.provider.send;
+  f.provider.send = async () => {
+    attempts++;
+    throw Object.assign(Error("email limit"), { status: 429, emailNotAccepted: true });
+  };
+  await assert.rejects(f.run("send-initial"), error => error.status === 429);
+  const rejected = (await f.state()).invitations[f.input.email];
+  assert.equal(rejected.status, "ready");
+  assert.ok(rejected.lastAttemptAt);
+  assert.equal(rejected.lastSendRejected, "rate_limit");
+  assert.equal(invitationView(rejected, f.clock()).canSendInitial, false);
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  f.advance(60 * 60_000 + 1);
+  assert.equal(invitationView((await f.state()).invitations[f.input.email], f.clock()).canSendInitial, true);
+  assert.equal(attempts, 1, "cooldown expiry never automatically sends");
+  f.provider.send = send;
+  await f.run("send-initial");
+  assert.equal(f.calls.sends, 1);
+  assert.equal((await f.state()).invitations[f.input.email].lastSendRejected, undefined);
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+});
+
+test("a failure during a retry cannot retain the earlier known-rejection exemption", async t => {
+  const f = await fixture(t);
+  await f.run("prepare");
+  f.provider.send = async () => { throw Object.assign(Error("email limit"), { status: 429, emailNotAccepted: true }); };
+  await assert.rejects(f.run("send-initial"), error => error.status === 429);
+  f.advance(60 * 60_000 + 1);
+  f.provider.send = async () => { throw Error("mail response lost"); };
+  await assert.rejects(f.run("send-initial"), error => error.status === 503);
+  const record = (await f.state()).invitations[f.input.email];
+  assert.equal(record.status, "delivery_unknown");
+  assert.equal(record.lastSendRejected, undefined);
+  f.advance(60 * 60_000 + 1);
+  assert.equal(invitationView(record, f.clock()).canSendInitial, false);
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+});
+
+test("a rejected resend does not erase an earlier accepted invitation or enable bulk recovery", async t => {
+  const f = await fixture(t);
+  const accepted = await f.run("create");
+  f.advance(60_001);
+  f.provider.send = async () => { throw Object.assign(Error("email limit"), { status: 429, emailNotAccepted: true }); };
+  await assert.rejects(f.run("resend"), error => error.status === 429);
+  f.advance(60 * 60_000 + 1);
+  const view = invitationView((await f.state()).invitations[f.input.email], f.clock());
+  assert.equal(view.status, "sent");
+  assert.equal(view.lastSentAt, accepted.invitation.lastSentAt);
+  assert.equal(view.canSendInitial, false);
+  assert.equal(view.canResend, true);
+  assert.match(view.message, /declined/);
+});
+
+test("an uncertain send followed by a rejected resend never regains first-send eligibility", async t => {
+  const f = await fixture(t);
+  await f.run("prepare");
+  const send = f.provider.send;
+  f.provider.send = async account => { await send(account); throw Error("mail response lost"); };
+  await assert.rejects(f.run("send-initial"), error => error.status === 503);
+  assert.equal((await f.state()).invitations[f.input.email].initialEmailEligible, false);
+  f.advance(60_001);
+  f.provider.send = async () => { throw Object.assign(Error("email limit"), { status: 429, emailNotAccepted: true }); };
+  await assert.rejects(f.run("resend"), error => error.status === 429);
+  f.advance(60 * 60_000 + 1);
+  const reconciled = await f.run("reconcile");
+  assert.equal(reconciled.invitation.status, "delivery_unknown");
+  assert.equal(reconciled.invitation.canSendInitial, false);
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  assert.equal(f.calls.sends, 1);
+});
+
+test("initial send rechecks membership and authorization before contacting the mail provider", async t => {
+  const f = await fixture(t);
+  const prepared = await f.run("prepare");
+  await assert.rejects(f.run("send-initial", { guard: () => { throw Object.assign(Error("roster changed"), { status: 409 }); } }), error => error.status === 409);
+  await assert.rejects(f.run("send-initial", { authorize: () => { throw Object.assign(Error("session ended"), { status: 401 }); } }), error => error.status === 401);
+  await assert.rejects(f.run("send-initial", {
+    audit: async action => {
+      if (action === "roster.invitation_reconcile") await f.storage.prepare("UPDATE members SET active=0 WHERE id=?").run(prepared.memberId);
+    },
+  }), error => error.status === 409);
+  assert.equal(f.calls.sends, 0);
+});
+
+test("confirmed or newly confirmed accounts cannot receive a recovery email through bulk initial send", async t => {
+  const f = await fixture(t);
+  const prepared = await f.run("prepare");
+  f.accounts.get(f.input.email).confirmed = true;
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  assert.equal(invitationView((await f.state()).invitations[f.input.email], f.clock()).canSendInitial, false);
+  assert.equal((await f.run("reconcile")).invitation.canSendInitial, false);
+  const state = await f.state();
+  delete state.invitations;
+  await f.setState(state);
+  const legacy = await f.run("reconcile");
+  assert.equal(legacy.memberId, prepared.memberId);
+  assert.equal(legacy.invitation.canSendInitial, false);
+  await assert.rejects(f.run("send-initial"), error => error.status === 409);
+  assert.equal(f.calls.sends, 0);
+  await f.run("resend");
+  assert.equal(f.calls.sends, 1, "individual reviewed resends remain available");
 });
 
 test("prepare recovery after an interrupted provider response never sends email", async t => {

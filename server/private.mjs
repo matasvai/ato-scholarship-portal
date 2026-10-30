@@ -862,7 +862,7 @@ async function accountSettingsView(workspace, target, state) {
 async function processInvitation(session, user, email, action, generation, input) {
   if (!production || authMode !== "chapter" || !chapterAuthConfigured(env))
     fail(422, "Account setup requires real chapter sign-in.");
-  if (["create", "resend"].includes(action) && !chapterEmailReady)
+  if (["create", "resend", "send-initial"].includes(action) && !chapterEmailReady)
     fail(503, "Configure and test chapter email before sending setup emails.");
   if (rosterStatus(env).mode === "public_email_csv" && !rosterView(await stateOf(session.workspace)).fresh)
     await refreshRoster(session, user);
@@ -2650,11 +2650,19 @@ const server = http.createServer(async (req, res) => {
         chair(user);
         const state = await stateOf(session.workspace);
         const invitations = invitationList(state);
-        for (const existing of await listMembers(session.workspace, state)) {
+        const members = await listMembers(session.workspace, state);
+        const eligibleMembers = new Map(members.filter(member => member.role === "member" && member.active)
+          .map(member => [member.email, member.id]));
+        const emailRoster = rosterStatus(env).mode === "public_email_csv";
+        for (const invitation of invitations) {
+          invitation.canSendInitial = invitation.canSendInitial && eligibleMembers.get(invitation.email) === invitation.memberId &&
+            (!emailRoster || rosterView(state).fresh && state.roster.emails.includes(invitation.email));
+        }
+        for (const existing of members) {
           if (existing.role !== "member" || !existing.active || existing.email.endsWith("@pilot.invalid") || state.invitations?.[existing.email]) continue;
           invitations.push({
             email: existing.email, name: existing.name, status: "untracked", memberId: existing.id,
-            loginId: null, lastSentAt: null, retryAt: null, canReconcile: true, canResend: false,
+            loginId: null, lastSentAt: null, retryAt: null, canReconcile: true, canResend: false, canSendInitial: false,
             message: "This account predates invitation tracking. Check its setup before sending another setup email.",
           });
         }
@@ -2669,7 +2677,7 @@ const server = http.createServer(async (req, res) => {
         const result = await processInvitation(session, user, prepared.email, "prepare", requestGeneration, prepared);
         return json(res, 201, result);
       }
-      const invitationAction = path.match(/^\/api\/admin\/invitations\/([^/]+)\/(reconcile|resend)$/);
+      const invitationAction = path.match(/^\/api\/admin\/invitations\/([^/]+)\/(reconcile|resend|send-initial)$/);
       if (invitationAction && req.method === "POST") {
         chair(user);
         let email;

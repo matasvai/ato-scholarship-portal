@@ -98,6 +98,15 @@
 .overview-submit { justify-content: flex-start; }
 
 .invitation-filters { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+.invitation-bulk-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 0 0 16px; }
+.invitation-select { display: inline-flex; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; cursor: pointer; }
+.invitation-select input { width: 20px; height: 20px; accent-color: var(--gold); }
+.invitation-batch-list { max-height: 320px; overflow-y: auto; border: 1px solid var(--line); }
+.invitation-batch-list ul { list-style: none; margin: 0; padding: 0; }
+.invitation-batch-list li { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 16px; padding: 12px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.invitation-batch-list li:last-child { border-bottom: 0; }
+.invitation-batch-list small { display: block; color: var(--muted); }
+.invitation-batch-list [data-batch-result] { font-size: 12px; color: var(--muted); }
 @media (max-width: 600px) { .invitation-filters { grid-template-columns: 1fr; } }
 
 .category-toolbar { display: flex; justify-content: flex-end; margin: 20px 0; }

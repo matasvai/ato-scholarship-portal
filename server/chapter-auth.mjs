@@ -1,4 +1,4 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, isAuthApiError } from "@supabase/supabase-js";
 
 const authOptions = {
   auth: {
@@ -125,17 +125,28 @@ export async function prepareInvitationAccount(env, email, proof) {
   return invitationIdentity(data.user, email);
 }
 
+function invitationSendError(error) {
+  // Only an explicit, recognized Auth rate-limit rejection proves the request
+  // was refused. Timeouts, SMTP failures and generic 5xx responses remain
+  // ambiguous and must never be treated as safe automatic retry candidates.
+  if (isAuthApiError(error) && error.status === 429 &&
+    ["over_email_send_rate_limit", "over_request_rate_limit"].includes(error.code))
+    return Object.assign(Error("The email service limit was reached. This email was not accepted. Sending stopped; wait at least one hour, then select the remaining recipients again."),
+      { status: 429, emailNotAccepted: true });
+  return Error("The setup email could not be confirmed.");
+}
+
 export async function sendInvitationAccount(env, account, redirectTo) {
   if (account.confirmed) {
     // Existing confirmed accounts cannot receive another invite; a recovery
     // link leads to the same password-setup form without replacing their user.
     const { error } = await invitationClient(env).auth.resetPasswordForEmail(account.email, { redirectTo });
-    if (error) throw Error("The setup email could not be confirmed.");
+    if (error) throw invitationSendError(error);
     return;
   }
   const { data, error } = await invitationClient(env).auth.admin.inviteUserByEmail(account.email, { redirectTo });
-  if (error || data?.user?.id !== account.id)
-    throw Error("The setup email could not be confirmed.");
+  if (error) throw invitationSendError(error);
+  if (data?.user?.id !== account.id) throw Error("The setup email could not be confirmed.");
 }
 
 export async function sendPasswordReset(env, email, redirectTo) {

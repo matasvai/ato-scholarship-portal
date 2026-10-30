@@ -2,6 +2,13 @@
 
 This is a working acceptance checklist, not a claim that version 1.0 is approved. Keep member emails, grades, passwords, recovery keys and private backup paths out of this public repository. Record the Chair's real decisions and test-recipient addresses in a chapter-controlled location.
 
+## Bulk invitation controls — October 30, 2026
+
+- 247 automated tests passed without failures or skips, including isolated PostgreSQL and first-invitation replay, concurrency, role, eligibility, rate-limit and interruption checks.
+- A fictional Chair browser session selected two prepared accounts, reviewed one recipient list, and completed the batch against a fake email provider. Both accounts then became unavailable for bulk selection. Browser errors were empty. No real email was sent.
+- Previous or uncertain sends and confirmed accounts cannot be bulk-selected. A definite provider rate-limit rejection requires a later manual selection; it cannot turn a previously uncertain send into a new first invitation.
+- Before a full rollout, check the actual Supabase and SMTP email allowances and complete the authorized inbox test below. Follow the [bulk invitation steps](EMAIL-ROLLOUT.md#send-several-invitations-with-one-review).
+
 ## Excel imports and no-email roster editing — October 30, 2026
 
 - 230 automated tests passed without failures or skips, including isolated PostgreSQL, account preparation/editing, student-ID validation and Excel workbook tests.

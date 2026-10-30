@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 
 const LEASE_MS = 90_000;
 const SEND_COOLDOWN_MS = 60_000;
+const EMAIL_LIMIT_COOLDOWN_MS = 60 * 60_000;
 const fail = (status, message) => { throw Object.assign(Error(message), { status }); };
 
 export function invitationView(record, time = Date.now()) {
@@ -17,7 +18,12 @@ export function invitationView(record, time = Date.now()) {
     retryAt: Math.max(record.retryAt || 0, busy ? record.operation.until : 0) || null,
     canReconcile: !busy,
     canResend: !busy && Boolean(record.bound) && ["ready", "sent", "delivery_unknown"].includes(status) && (record.retryAt || 0) <= time,
-    message: status === "sent" ? "The email service accepted the setup email. Ask the member to check their inbox and spam folder."
+    canSendInitial: !busy && Boolean(record.bound) && record.initialEmailEligible !== false && status === "ready" &&
+      (!record.lastAttemptAt || record.lastSendRejected === "rate_limit") && !record.lastSentAt && (record.retryAt || 0) <= time,
+    message: ["ready", "sent"].includes(status) && record.lastSendRejected === "rate_limit"
+      ? (record.retryAt || 0) > time ? "The latest email request was declined because the email service's sending limit was reached. Wait at least one hour before selecting it again."
+        : "The latest email request was declined by the email service's sending limit. It can now be selected again."
+      : status === "sent" ? "The email service accepted the setup email. Ask the member to check their inbox and spam folder."
       : status === "delivery_unknown" ? "The account is ready, but email delivery could not be confirmed. Check the inbox before choosing to resend."
       : status === "ready" ? "The account is ready. No setup email was sent by this check."
       : status === "failed" ? "Account preparation was interrupted. Check account setup to safely resume."
@@ -37,7 +43,7 @@ export async function runInvitation({
   db, workspace, email, input, action = "create", authorize, guard,
   provider, audit = async () => {}, now = Date.now,
 }) {
-  if (!["create", "prepare", "reconcile", "resend"].includes(action)) fail(422, "Unknown invitation action.");
+  if (!["create", "prepare", "reconcile", "resend", "send-initial"].includes(action)) fail(422, "Unknown invitation action.");
   const operationId = randomUUID();
   const load = async () => {
     const row = await db.prepare("SELECT data FROM chapters WHERE workspace=? FOR UPDATE").get(workspace);
@@ -76,6 +82,12 @@ export async function runInvitation({
     const existing = await memberForEmail();
     if (existing && (existing.role !== "member" || !existing.active))
       fail(409, "This email belongs to an office or inactive account. Manage that account separately.");
+    // Bulk initial sends cannot provision accounts, replay accepted/uncertain
+    // attempts, or become implicit resends after a lost response. A proven
+    // rate-limit rejection is selectable again only after its cooldown.
+    if (action === "send-initial" && (!existing || !record?.authUserId ||
+      !invitationView(record, now())?.canSendInitial))
+      fail(409, "This account is not eligible for a first setup email. Refresh its status; review any resend separately.");
     // Repeated create/prepare requests never send an email. Sending a prepared
     // account or retrying a delivery always requires the explicit send action.
     if (record && ["create", "prepare"].includes(action) && record.bound)
@@ -121,7 +133,7 @@ export async function runInvitation({
   });
   if (reservation.complete) return { invitation: invitationView(reservation.record, now()), memberId: reservation.record.memberId };
 
-  let sending = false;
+  let sending = false, sendPriorStatus, initialEligibleBeforeSend = false;
   try {
     let account = await provider.find(email);
     let createdAuth = false;
@@ -163,18 +175,36 @@ export async function runInvitation({
       record.credits = existing?.credits ?? record.credits;
       record.authUserId = account.id;
       record.bound = true;
+      // A confirmed identity already has a working account. Bulk first-time
+      // invitations must never turn into recovery links for those members.
+      record.initialEmailEligible = record.initialEmailEligible !== false && !account.confirmed &&
+        !["sent", "sending", "delivery_unknown"].includes(record.status) && !record.lastSentAt &&
+        (!record.lastAttemptAt || record.lastSendRejected === "rate_limit");
       // A legacy orphan may already have received a link. Repair it without
       // delivering a surprise second email or resetting its password.
       if (isNewIntent && !createdAuth && action === "create") record.status = "delivery_unknown";
       else if (!["sent", "delivery_unknown"].includes(record.status)) record.status = "ready";
       await audit("roster.invitation_reconcile", record.memberId, `Account ready; ${!existing ? `tier ${tier}; credits ${record.credits}` : "existing member retained"}.`);
     });
-    const shouldSend = action === "resend" || (action === "create" && isNewIntent && createdAuth);
+    const shouldSend = ["resend", "send-initial"].includes(action) || (action === "create" && isNewIntent && createdAuth);
     if (shouldSend) {
       // Mark the attempt before crossing the email boundary. If the server
       // crashes after the provider accepts it, no automatic replay is possible.
       await update(async record => {
+        const existing = await memberForEmail();
+        if (!existing || existing.id !== record.memberId || existing.role !== "member" || !existing.active)
+          fail(409, "This member is no longer eligible to receive a setup email.");
+        if (action === "send-initial" && (account.confirmed || record.initialEmailEligible === false ||
+          record.status !== "ready" || (record.lastAttemptAt && record.lastSendRejected !== "rate_limit") || record.lastSentAt))
+          fail(409, "This account no longer qualifies for a first setup email. Refresh its status; review any resend separately.");
+        sendPriorStatus = record.status;
+        initialEligibleBeforeSend = record.initialEmailEligible !== false && record.status === "ready" &&
+          !record.lastSentAt && (!record.lastAttemptAt || record.lastSendRejected === "rate_limit");
+        // Consume eligibility durably before the network boundary. Only a
+        // proven rejection of this attempt may restore its previous value.
+        record.initialEmailEligible = false;
         record.status = "sending";
+        delete record.lastSendRejected;
         record.retryAt = now() + SEND_COOLDOWN_MS;
         record.lastAttemptAt = new Date(now()).toISOString();
         record.operation.until = now() + LEASE_MS;
@@ -199,8 +229,15 @@ export async function runInvitation({
       const state = await load();
       const record = state.invitations?.[email];
       if (record?.operation?.id !== operationId) return;
-      record.status = sending || record.status === "sending" ? "delivery_unknown"
+      const rejectedByLimit = sending && error.status === 429 && error.emailNotAccepted === true;
+      record.status = rejectedByLimit ? sendPriorStatus === "delivery_unknown" ? "delivery_unknown" : record.lastSentAt ? "sent" : "ready" : sending || record.status === "sending" ? "delivery_unknown"
         : record.bound && ["ready", "sent", "delivery_unknown"].includes(record.status) ? record.status : "failed";
+      if (rejectedByLimit) {
+        record.initialEmailEligible = initialEligibleBeforeSend;
+        record.lastSendRejected = "rate_limit";
+        record.retryAt = now() + EMAIL_LIMIT_COOLDOWN_MS;
+        await audit("roster.invitation_rate_limited", record.memberId, "Email service rejected the setup email due to its rate limit. No automatic retry.");
+      }
       record.updatedAt = new Date(now()).toISOString();
       delete record.operation;
       await save(state);

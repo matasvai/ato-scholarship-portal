@@ -1596,6 +1596,95 @@ async function rosterPage() {
   }
 }
 let invitationStatusLoad = 0;
+function mountInvitationSelection(panel, invitations) {
+  const selected = new Set(), selectAll = panel.querySelector('[data-select-ready]');
+  const clear = panel.querySelector('[data-clear-ready]'), review = panel.querySelector('[data-review-invitations]');
+  const boxes = [...panel.querySelectorAll('[data-select-invitation]')];
+  const visibleBoxes = () => boxes.filter(box => !box.closest('[data-prepared-index]').hidden);
+  const update = () => {
+    selectAll.disabled = visibleBoxes().length === 0;
+    selectAll.textContent = panel.querySelector('#prepared-search').value.trim() || panel.querySelector('#prepared-status').value !== 'all'
+      ? 'Select all shown ready' : 'Select all ready';
+    clear.disabled = review.disabled = selected.size === 0;
+    const hidden = boxes.filter(box => box.checked && box.closest('[data-prepared-index]').hidden).length;
+    panel.querySelector('[data-selected-count]').textContent = `${selected.size} selected${hidden ? ` (${hidden} hidden by filters)` : ''}`;
+    review.textContent = selected.size ? `Review ${selected.size} invitations` : 'Review invitations';
+  };
+  boxes.forEach(box => box.onchange = () => {
+    const index = Number(box.dataset.selectInvitation);
+    if (box.checked) selected.add(index); else selected.delete(index);
+    update();
+  });
+  selectAll.onclick = () => { visibleBoxes().forEach(box => { box.checked = true; selected.add(Number(box.dataset.selectInvitation)); }); update(); };
+  clear.onclick = () => { selected.clear(); boxes.forEach(box => { box.checked = false; }); update(); };
+  review.onclick = () => reviewBulkInvitations([...selected].map(index => invitations[index]), panel);
+  update();
+  return update;
+}
+function reviewBulkInvitations(recipients, sourcePanel) {
+  const owner = user?.id, epoch = sessionEpoch, page = location.hash;
+  // Snapshot only recipients explicitly selected for a first setup email.
+  const selected = recipients.filter(item => item.canSendInitial).map(item => ({name: item.name, email: item.email}));
+  if (!selected.length || user?.role !== 'chair') return;
+  openModal('SEND INVITATIONS', '', `<p>Send a separate, one-time password setup link to these <strong>${selected.length} members</strong>.</p><div class="invitation-batch-list"><ul>${selected.map((item, index) => `<li><div><strong>${esc(item.name)}</strong><small>${esc(item.email)}</small></div><span data-batch-result="${index}">Not sent</span></li>`).join('')}</ul></div><p class="muted">Keep this page open while sending. Closing this window stops the remaining emails; an email already being sent may still arrive. Previous sends and uncertain deliveries are excluded. Sending may pause if the email service reaches its limit; unsent recipients can be selected later.</p><form id="invitation-batch-form"><label class="checkbox-line"><input id="invitation-batch-confirm" type="checkbox" required><span>I reviewed this recipient list and want to send these invitations now.</span></label><div class="invitation-feedback" role="status" aria-live="polite"></div><div class="modal-actions"><button class="button ghost" data-batch-stop type="button">Cancel</button><button class="button gold" type="submit">Send ${selected.length} invitations</button></div></form>`);
+  const form = $('#invitation-batch-form'), feedback = form.querySelector('.invitation-feedback');
+  const confirmation = form.querySelector('#invitation-batch-confirm'), submit = form.querySelector('[type="submit"]');
+  const stop = form.querySelector('[data-batch-stop]');
+  let stopped = false, sending = false, finished = false, accepted = 0;
+  const sameSession = () => user?.id === owner && user?.role === 'chair' && sessionEpoch === epoch;
+  const current = () => sameSession() && form.isConnected && modal.open && sourcePanel.isConnected && location.hash === page;
+  stop.onclick = () => {
+    stopped = true;
+    if (!sending) { modal.close(); return; }
+    stop.disabled = true;
+    stop.textContent = 'Stopping…';
+    feedback.innerHTML = loading('Stopping after the current email…', true);
+  };
+  form.onsubmit = async event => {
+    event.preventDefault();
+    if (sending || finished || stopped || !current() || !confirmation.checked) return;
+    sending = true;
+    confirmation.disabled = submit.disabled = true;
+    stop.textContent = 'Stop remaining';
+    let problem = '';
+    try {
+      for (let index = 0; index < selected.length; index++) {
+        if (!current() || stopped) break;
+        const item = selected[index], outcome = $('#modal-content').querySelector(`[data-batch-result="${index}"]`);
+        feedback.innerHTML = loading(`Sending ${index + 1} of ${selected.length}…`, true);
+        outcome.textContent = 'Sending…';
+        try {
+          const result = await api(`/api/admin/invitations/${encodeURIComponent(item.email)}/send-initial`, {method:'POST', body:{}});
+          if (!current()) return;
+          if (result.invitation?.status !== 'sent') {
+            outcome.textContent = 'Needs checking';
+            problem = 'The email result needs checking. The remaining invitations were not sent. Refresh account status before continuing.';
+            break;
+          }
+          accepted++;
+          outcome.textContent = 'Accepted by email service';
+        } catch (error) {
+          if (!current()) return;
+          outcome.textContent = 'Needs checking';
+          problem = `${error.message} The remaining invitations were not sent. Refresh account status before continuing.`;
+          break;
+        }
+        // Sequential requests avoid a burst; provider limits can still stop a batch.
+        if (index < selected.length - 1 && !stopped && current()) await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    } finally {
+      sending = false;
+      finished = true;
+      if (current()) {
+        feedback.textContent = `${accepted} of ${selected.length} accepted by the email service. ${problem || (stopped ? 'Remaining invitations were not sent.' : 'Recipients should check their inbox and spam folder.')} Inbox delivery is not verified.`;
+        stop.disabled = false;
+        stop.textContent = 'Done';
+      }
+      // Status persists on the server, including ambiguous delivery. Never retry it here.
+      if (sameSession() && sourcePanel.isConnected && location.hash === page) await loadInvitationStatus();
+    }
+  };
+}
 async function loadInvitationStatus() {
   const panel = $('#invitation-status'), revision = ++invitationStatusLoad;
   if (!panel?.isConnected) return;
@@ -1604,18 +1693,19 @@ async function loadInvitationStatus() {
   try {
     const {invitations, emailReady} = await api('/api/admin/invitations');
     if (!current()) return;
-    const ready = invitations.filter(item => item.status === 'ready').length;
+    const ready = invitations.filter(item => item.canSendInitial).length;
     const accepted = invitations.filter(item => item.status === 'sent').length;
     const attention = invitations.filter(item => ['untracked', 'failed', 'delivery_unknown'].includes(item.status)).length;
-    panel.innerHTML = `<div class="section-heading"><h2>ACCOUNT SETUP & EMAILS</h2><button class="text-btn" data-refresh-invitations type="button">Refresh</button></div><p class="muted">${ready} ready to send · ${accepted} accepted by email service · ${attention} need attention</p><p class="muted">${emailReady ? "Email sending is enabled. Verify delivery with one agreed test recipient before the full rollout." : "Accounts can be prepared before email sending is enabled."} A successful send still needs the recipient to confirm it arrived.</p>${emailReady ? '' : '<p class="notice info">Email sending is not enabled. You can still check and repair account setup without sending anything.</p>'}${invitations.length ? `<div class="invitation-filters"><div class="field"><label for="prepared-search">Find a prepared account</label><input id="prepared-search" type="search" placeholder="Name or email"></div><div class="field"><label for="prepared-status">Email status</label><select id="prepared-status"><option value="all">All accounts</option><option value="ready">Ready to send</option><option value="sent">Accepted by email service</option><option value="attention">Needs attention</option></select></div></div><div class="table-wrap"><table><thead><tr><th>Recipient</th><th>Status</th><th>Last sent</th><th>Actions</th></tr></thead><tbody>${invitations.map((item,index) => `<tr data-prepared-index="${index}"><td><strong>${esc(item.name)}</strong><small>${esc(item.email)}</small><code>${esc(item.loginId || '')}</code></td><td>${esc(labels[item.status] || item.status)}<small>${esc(item.message || '')}</small></td><td>${item.lastSentAt ? esc(new Date(item.lastSentAt).toLocaleString()) : '—'}</td><td>${item.memberId ? `<button class="table-link" data-action="edit-academic-settings" data-id="${esc(item.memberId)}">Edit member</button>` : ""}${item.canReconcile ? `<button class="table-link" data-invitation-index="${index}" data-operation="reconcile">Check account setup</button>` : ''}${item.canResend && emailReady ? `<button class="table-link" data-invitation-index="${index}" data-operation="resend">${item.status === "ready" && !item.lastSentAt ? "Review setup email" : "Review resend"}</button>` : item.retryAt > Date.now() ? '<small>Wait one minute, then refresh.</small>' : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p>No accounts have been prepared. Refresh the roster above, then choose a member.</p>'}`;
+    panel.innerHTML = `<div class="section-heading"><h2>ACCOUNT SETUP & EMAILS</h2><button class="text-btn" data-refresh-invitations type="button">Refresh</button></div><p class="muted">${ready} ready to send · ${accepted} accepted by email service · ${attention} need attention</p><p class="muted">${emailReady ? "Email sending is enabled. Verify delivery with one agreed test recipient before the full rollout." : "Accounts can be prepared before email sending is enabled."} A successful send still needs the recipient to confirm it arrived.</p>${emailReady ? '' : '<p class="notice info">Email sending is not enabled. You can still check and repair account setup without sending anything.</p>'}${invitations.length ? `<div class="invitation-filters"><div class="field"><label for="prepared-search">Find a prepared account</label><input id="prepared-search" type="search" placeholder="Name or email"></div><div class="field"><label for="prepared-status">Email status</label><select id="prepared-status"><option value="all">All accounts</option><option value="ready">Ready to send</option><option value="sent">Accepted by email service</option><option value="attention">Needs attention</option></select></div></div><div class="invitation-bulk-actions"><button class="button ghost" data-select-ready type="button" ${emailReady ? "" : "disabled"}>Select all ready</button><button class="text-btn" data-clear-ready type="button" disabled>Clear selection</button><span class="muted" data-selected-count role="status">0 selected</span><button class="button gold" data-review-invitations type="button" disabled>Review invitations</button></div><div class="table-wrap"><table><thead><tr><th>Select</th><th>Recipient</th><th>Status</th><th>Last sent</th><th>Actions</th></tr></thead><tbody>${invitations.map((item,index) => `<tr data-prepared-index="${index}"><td>${item.canSendInitial && emailReady ? `<label class="invitation-select"><input type="checkbox" data-select-invitation="${index}" aria-label="Select ${esc(item.name)} (${esc(item.email)})"></label>` : "—"}</td><td><strong>${esc(item.name)}</strong><small>${esc(item.email)}</small><code>${esc(item.loginId || '')}</code></td><td>${esc(item.status === 'ready' && item.retryAt > Date.now() ? 'Waiting to send' : labels[item.status] || item.status)}<small>${esc(item.message || '')}</small></td><td>${item.lastSentAt ? esc(new Date(item.lastSentAt).toLocaleString()) : '—'}</td><td>${item.memberId ? `<button class="table-link" data-action="edit-academic-settings" data-id="${esc(item.memberId)}">Edit member</button>` : ""}${item.canReconcile ? `<button class="table-link" data-invitation-index="${index}" data-operation="reconcile">Check account setup</button>` : ''}${item.canResend && emailReady ? `<button class="table-link" data-invitation-index="${index}" data-operation="resend">${item.status === "ready" && !item.lastSentAt ? "Review setup email" : "Review resend"}</button>` : item.retryAt > Date.now() ? `<small>Available after ${esc(new Date(item.retryAt).toLocaleString())}. Refresh then.</small>` : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p>No accounts have been prepared. Refresh the roster above, then choose a member.</p>'}`;
     panel.querySelector('[data-refresh-invitations]').onclick = loadInvitationStatus;
+    const updateSelection = invitations.length ? mountInvitationSelection(panel, invitations) : () => {};
     const search = panel.querySelector('#prepared-search'), status = panel.querySelector('#prepared-status');
     if (search && status) {
-      const filter = () => panel.querySelectorAll('[data-prepared-index]').forEach(row => {
+      const filter = () => { panel.querySelectorAll('[data-prepared-index]').forEach(row => {
         const item = invitations[Number(row.dataset.preparedIndex)];
         row.hidden = !`${item.name} ${item.email}`.toLowerCase().includes(search.value.trim().toLowerCase()) ||
-          (status.value !== 'all' && (status.value === 'attention' ? !['untracked', 'failed', 'delivery_unknown'].includes(item.status) : item.status !== status.value));
-      });
+          (status.value !== 'all' && (status.value === 'attention' ? !['untracked', 'failed', 'delivery_unknown'].includes(item.status) : status.value === 'ready' ? !item.canSendInitial : item.status !== status.value));
+      }); updateSelection(); };
       search.oninput = status.onchange = filter;
     }
     panel.querySelectorAll('[data-invitation-index]').forEach(button => button.onclick = () => {
@@ -1662,7 +1752,7 @@ async function loadRosterSync() {
     rosterCandidates = candidates.filter((entry) => entry.accountStatus === "not_invited");
     const needsAttention = candidates.filter((entry) => ["inactive", "missing_sign_in"].includes(entry.accountStatus)).length;
     const description = emailMode
-      ? "The portal reads active and new-member names and university emails from the chapter sheet. The Chair reviews each invitation; the sheet is never edited by this portal."
+      ? "The portal reads active and new-member names and university emails from the chapter sheet. The Chair can review and send selected invitations together; the sheet is never edited by this portal."
       : "Copy each Portal Member ID below into the sheet, then use TRUE or FALSE in its Active column. Chapter sign-in identifies the member; the sheet controls continuing access.";
     const count = result.fetchedAt
       ? `Last successful refresh: ${esc(new Date(result.fetchedAt).toLocaleString())}. ${result.activeCount} eligible ${emailMode ? `members (${result.newMemberCount || 0} new)` : "IDs"}.`
@@ -1699,6 +1789,7 @@ async function loadRosterSync() {
         toast(error.message);
       }
       await loadRosterSync();
+      if (appConfig.chapterAuth?.enabled) await loadInvitationStatus();
     };
   } catch (error) {
     if (panel.isConnected)

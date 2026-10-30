@@ -100,6 +100,7 @@ test("Chair prepares and edits roster accounts without email, preserving identit
     assert.equal((await send("/api/admin/invitations/member%40example.edu/reconcile", {})).status, 200);
     assert.equal(storage.prepare("SELECT member_id FROM identities WHERE provider='login' AND subject='1234'").get(), undefined, "reconcile cannot restore removed badge");
     assert.equal((await send("/api/admin/invitations/member%40example.edu/resend", {})).status, 503);
+    assert.equal((await send("/api/admin/invitations/member%40example.edu/send-initial", {})).status, 503);
     const freshEdit = async changes => ({ ...edit, version: (await send(route)).payload.version, ...changes });
     let value = state();
     value.invitations["reserved@example.edu"] = { email: "reserved@example.edu", badge: "reserved-badge", alias: "reserved-login" };
