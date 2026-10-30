@@ -835,7 +835,7 @@ function validateChapterMember(input) {
   const email = typeof input.email === "string" ? input.email.trim().toLowerCase() : "";
   const badge = typeof input.badge === "string" ? input.badge.trim().toLowerCase() : "";
   if (
-    !name || name.length > 100 ||
+    !name || name.length > 100 || /[\u0000-\u001f\u007f]/.test(name) ||
     !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 ||
     (badge && !/^[a-z0-9][a-z0-9-]{0,31}$/.test(badge)) ||
     !Number.isInteger(input.tier) || input.tier < 1 || input.tier > 5 ||
@@ -843,10 +843,26 @@ function validateChapterMember(input) {
   ) fail(422, "Enter a name, valid email, optional badge number, tier and credits.");
   return { name, email, badge, tier: input.tier, credits: input.credits };
 }
+async function accountSettingsView(workspace, target, state) {
+  const aliases = (await db.prepare("SELECT subject FROM identities WHERE workspace=? AND provider='login' AND member_id=? ORDER BY subject")
+    .all(workspace, target.id)).map(entry => entry.subject);
+  const invitation = state.invitations?.[target.email];
+  const alias = invitation?.alias || aliases.find(value => /^kh-[a-f0-9]{10}$/.test(value)) || aliases[0] || "";
+  const badge = invitation?.badge ?? aliases.find(value => value !== alias) ?? "";
+  const membership = state.roster?.directory?.find(entry => entry.email === target.email)?.membership || "active";
+  const managedCredits = creditsManaged(state, target.id);
+  const version = sha(JSON.stringify({
+    id: target.id, name: target.name, email: target.email, role: target.role,
+    active: target.active, tier: target.tier, credits: target.credits, aliases,
+    alias, badge, membership, managedCredits, generation: state.semesterGeneration || null,
+    invitation: invitation && { updatedAt: invitation.updatedAt, operation: invitation.operation },
+  }));
+  return { member: target, badge, loginId: alias.toUpperCase() || null, version, membership, creditsManaged: managedCredits };
+}
 async function processInvitation(session, user, email, action, generation, input) {
   if (!production || authMode !== "chapter" || !chapterAuthConfigured(env))
     fail(422, "Account setup requires real chapter sign-in.");
-  if (action !== "reconcile" && !chapterEmailReady)
+  if (["create", "resend"].includes(action) && !chapterEmailReady)
     fail(503, "Configure and test chapter email before sending setup emails.");
   if (rosterStatus(env).mode === "public_email_csv" && !rosterView(await stateOf(session.workspace)).fresh)
     await refreshRoster(session, user);
@@ -1508,13 +1524,15 @@ const server = http.createServer(async (req, res) => {
           ).all(session.workspace)).map((entry) => entry.member_id));
           view.candidates = state.roster.directory.map((entry) => {
             const account = enrolled.get(entry.email);
+            const invitation = invitationView(state.invitations?.[entry.email]);
             return {
               ...entry,
+              accountId: account?.id || null,
               assignedTier: entry.membership === "new_member" ? 1 :
-                state.tierAssignments?.[entry.email] ?? null,
+                account?.tier ?? state.tierAssignments?.[entry.email] ?? null,
               accountStatus: !account ? "not_invited" : !account.active ? "inactive" :
-                linked.has(account.id) ? "invited" : "missing_sign_in",
-              invitation: invitationView(state.invitations?.[entry.email]),
+                !linked.has(account.id) ? "missing_sign_in" : invitation?.status === "ready" ? "account_ready" : "invited",
+              invitation,
             };
           });
         }
@@ -2544,6 +2562,7 @@ const server = http.createServer(async (req, res) => {
           })) fail(409, "The roster changed. Refresh it before importing tiers.");
           view.targets = view.targets.map((target) => ({
             ...target, schoolId: byEmail.get(target.email).schoolId,
+              ...(byEmail.get(target.email).schoolIdIssue ? { schoolIdIssue: byEmail.get(target.email).schoolIdIssue } : {}),
           }));
         }
         await assertActiveSession(session, user);
@@ -2642,6 +2661,14 @@ const server = http.createServer(async (req, res) => {
         invitations.sort((a, b) => a.name.localeCompare(b.name));
         return json(res, 200, { invitations, emailReady: chapterEmailReady });
       }
+      if (path === "/api/admin/invitations/prepare" && req.method === "POST") {
+        chair(user);
+        if (Object.keys(input).sort().join(",") !== "badge,credits,email,name,tier")
+          fail(422, "Supply only member name, email, badge, tier and credits.");
+        const prepared = validateChapterMember(input);
+        const result = await processInvitation(session, user, prepared.email, "prepare", requestGeneration, prepared);
+        return json(res, 201, result);
+      }
       const invitationAction = path.match(/^\/api\/admin\/invitations\/([^/]+)\/(reconcile|resend)$/);
       if (invitationAction && req.method === "POST") {
         chair(user);
@@ -2708,6 +2735,73 @@ const server = http.createServer(async (req, res) => {
           return await member(session.workspace, id);
         });
         return json(res, 201, { member: created });
+      }
+      const accountSettings = path.match(/^\/api\/roster\/([^/]+)\/account-settings$/);
+      if (accountSettings && ["GET", "POST"].includes(req.method)) {
+        chair(user);
+        if (req.method === "POST" && (Object.keys(input).sort().join(",") !== "badge,credits,name,tier,version" ||
+          typeof input.version !== "string" || !/^[a-f0-9]{64}$/.test(input.version)))
+          fail(422, "Submit the reviewed account details and version. The sign-in email cannot be changed here.");
+        if (production && rosterStatus(env).mode === "public_email_csv" && !rosterView(await stateOf(session.workspace)).fresh)
+          await refreshRoster(session, user);
+        const result = await atomic(async () => {
+          await lockWorkspace(session.workspace);
+          await assertActiveSession(session, user);
+          const state = await stateOf(session.workspace);
+          const target = await member(session.workspace, accountSettings[1]);
+          if (!target?.active || target.role !== "member") fail(404, "Active member not found.");
+          const current = await accountSettingsView(session.workspace, target, state);
+          if (req.method === "GET") return current;
+          academicGuard(state, requestGeneration);
+          if (current.version !== input.version) fail(409, "This account changed. Reopen its settings before saving.");
+          if (production && rosterStatus(env).mode === "public_email_csv" && !target.email.endsWith("@pilot.invalid") &&
+            (!rosterView(state).fresh || !state.roster.emails.includes(target.email)))
+            fail(409, "Refresh the roster and confirm this member is still eligible before saving.");
+          const details = validateChapterMember({ ...input, email: target.email });
+          if (current.membership === "new_member" && details.tier !== 1)
+            fail(422, "New members must be assigned Tier 1.");
+          if (current.creditsManaged && target.credits !== details.credits)
+            fail(409, "This member’s credit hours come from approved classes. Review their classes to change the total.");
+          const record = state.invitations?.[target.email];
+          if ((record?.operation?.until || 0) > Date.now())
+            fail(409, "Account setup is in progress. Refresh its status before editing.");
+          let alias = current.loginId?.toLowerCase();
+          if (!alias) {
+            do { alias = loginAlias().toLowerCase(); }
+            while (await db.prepare("SELECT member_id FROM identities WHERE workspace=? AND provider='login' AND subject=?").get(session.workspace, alias) ||
+              Object.values(state.invitations || {}).some(entry => entry.alias === alias || entry.badge === alias));
+          }
+          const permanentLogin = await db.prepare("SELECT member_id FROM identities WHERE workspace=? AND provider='login' AND subject=?")
+            .get(session.workspace, alias);
+          if (permanentLogin && permanentLogin.member_id !== target.id)
+            fail(409, "The permanent login is linked to another account. Ask the portal operator to check it.");
+          if (!permanentLogin) await db.prepare("INSERT INTO identities VALUES (?,?,?,?)").run(session.workspace, "login", alias, target.id);
+          if (details.badge && details.badge === alias)
+            fail(422, "The badge must be different from the permanent login ID.");
+          if (details.badge) {
+            const existing = await db.prepare("SELECT member_id FROM identities WHERE workspace=? AND provider='login' AND subject=?")
+              .get(session.workspace, details.badge);
+            if (existing && existing.member_id !== target.id || Object.values(state.invitations || {})
+              .some(entry => entry.email !== target.email && (entry.badge === details.badge || entry.alias === details.badge)))
+              fail(409, "Another member already uses or has reserved this badge number.");
+          }
+          if (current.badge && current.badge !== alias && current.badge !== details.badge)
+            await db.prepare("DELETE FROM identities WHERE workspace=? AND provider='login' AND subject=? AND member_id=?")
+              .run(session.workspace, current.badge, target.id);
+          if (details.badge && !(await db.prepare("SELECT member_id FROM identities WHERE workspace=? AND provider='login' AND subject=?")
+            .get(session.workspace, details.badge)))
+            await db.prepare("INSERT INTO identities VALUES (?,?,?,?)").run(session.workspace, "login", details.badge, target.id);
+          await db.prepare("UPDATE members SET name=?,tier=?,credits=? WHERE workspace=? AND id=? AND role='member' AND active=1")
+            .run(details.name, details.tier, details.credits, session.workspace, target.id);
+          if (record) Object.assign(record, { name: details.name, badge: details.badge, alias, tier: details.tier, credits: details.credits, updatedAt: now() });
+          if (state.tierAssignments) delete state.tierAssignments[target.email];
+          if (target.credits !== details.credits) refreshPendingCreditEstimates(state, target.id, multiplier({ credits: details.credits }));
+          await db.prepare("UPDATE chapters SET data=? WHERE workspace=?").run(JSON.stringify(state), session.workspace);
+          await audit(session.workspace, user.name, "roster.account_settings", target.id,
+            `Account details updated without email; tier ${target.tier} to ${details.tier}; credits ${target.credits} to ${details.credits}`);
+          return await accountSettingsView(session.workspace, await member(session.workspace, target.id), state);
+        });
+        return json(res, 200, result);
       }
       const academicSettings = path.match(/^\/api\/roster\/([^/]+)\/academic-settings$/);
       if (academicSettings && req.method === "POST") {
@@ -3074,6 +3168,12 @@ const server = http.createServer(async (req, res) => {
       "/ato-logo.png": "ato-logo.png",
       "/app.js": "app.js",
       "/gpa-import.mjs": "gpa-import.mjs",
+      "/school-id.mjs": "school-id.mjs",
+      "/gpa-workbook.mjs": "gpa-workbook.mjs",
+      "/gpa-workbook-data.mjs": "gpa-workbook-data.mjs",
+      "/gpa-workbook-worker.js": "gpa-workbook-worker.js",
+      "/vendor/xlsx-0.20.3.full.min.js": "vendor/xlsx-0.20.3.full.min.js",
+      "/vendor/SheetJS-LICENSE.txt": "vendor/SheetJS-LICENSE.txt",
       "/faq-data.mjs": "faq-data.mjs",
       "/faq-ui.mjs": "faq-ui.mjs",
       "/profile-data.mjs": "profile-data.mjs",

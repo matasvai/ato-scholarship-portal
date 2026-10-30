@@ -37,7 +37,7 @@ export async function runInvitation({
   db, workspace, email, input, action = "create", authorize, guard,
   provider, audit = async () => {}, now = Date.now,
 }) {
-  if (!["create", "reconcile", "resend"].includes(action)) fail(422, "Unknown invitation action.");
+  if (!["create", "prepare", "reconcile", "resend"].includes(action)) fail(422, "Unknown invitation action.");
   const operationId = randomUUID();
   const load = async () => {
     const row = await db.prepare("SELECT data FROM chapters WHERE workspace=? FOR UPDATE").get(workspace);
@@ -73,25 +73,29 @@ export async function runInvitation({
     let record = state.invitations[email];
     if ((record?.operation?.until || 0) > now()) fail(409, "This account is already being prepared. Refresh shortly.");
     if (record?.status === "sending") record.status = "delivery_unknown";
-    // A repeated create request never sends a second email, even if its first
-    // response was lost. The explicit resend endpoint is the only retry sender.
-    if (record && action === "create" && record.bound)
-      return { complete: true, record: structuredClone(record) };
     const existing = await memberForEmail();
     if (existing && (existing.role !== "member" || !existing.active))
       fail(409, "This email belongs to an office or inactive account. Manage that account separately.");
+    // Repeated create/prepare requests never send an email. Sending a prepared
+    // account or retrying a delivery always requires the explicit send action.
+    if (record && ["create", "prepare"].includes(action) && record.bound)
+      return { complete: true, record: structuredClone(record) };
     if (!record) {
-      if (action !== "create" && !existing) fail(404, "No account setup was found for this email.");
+      if (!["create", "prepare"].includes(action) && !existing) fail(404, "No account setup was found for this email.");
       if (existing && action === "create") fail(409, "A member already uses this email address. Use Check account setup or Resend setup email.");
       isNewIntent = true;
       const details = existing || input;
       if (!details || details.email.toLowerCase() !== email) fail(422, "Member details are required.");
-      const badge = existing ? "" : details.badge;
-      if (badge && (await identity("login", badge) || Object.values(state.invitations)
+      const existingAliases = existing ? (await db.prepare("SELECT subject FROM identities WHERE workspace=? AND provider='login' AND member_id=? ORDER BY subject")
+        .all(workspace, existing.id)).map(entry => entry.subject) : [];
+      // Reconciliation must preserve the generated portal ID, even when a
+      // numeric badge sorts ahead of it. Keep the badge editable separately.
+      let alias = existingAliases.find(value => /^kh-[a-f0-9]{10}$/.test(value)) || existingAliases[0];
+      const badge = existing ? existingAliases.find(value => value !== alias) || "" : details.badge;
+      const badgeIdentity = badge ? await identity("login", badge) : null;
+      if (badge && (badgeIdentity && badgeIdentity.member_id !== existing?.id || Object.values(state.invitations)
         .some(entry => entry.email !== email && (entry.badge === badge || entry.alias === badge))))
         fail(409, "A member already uses this badge number.");
-      let alias = existing && (await db.prepare("SELECT subject FROM identities WHERE workspace=? AND provider='login' AND member_id=? ORDER BY subject")
-        .get(workspace, existing.id))?.subject;
       if (!alias) {
         do { alias = `kh-${randomBytes(5).toString("hex")}`; }
         while (await identity("login", alias) || Object.values(state.invitations).some(entry => entry.alias === alias || entry.badge === alias));
@@ -154,6 +158,9 @@ export async function runInvitation({
         if (!found) await db.prepare("INSERT INTO identities VALUES (?,?,?,?)").run(workspace, kind, subject, record.memberId);
       }
       if (!existing && state.tierAssignments) delete state.tierAssignments[email];
+      record.name = existing?.name ?? record.name;
+      record.tier = existing?.tier ?? tier;
+      record.credits = existing?.credits ?? record.credits;
       record.authUserId = account.id;
       record.bound = true;
       // A legacy orphan may already have received a link. Repair it without

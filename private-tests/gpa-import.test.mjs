@@ -36,6 +36,47 @@ test("CSV import refuses missing columns, malformed quotations, and invalid GPA"
   assert.equal(rows[0].tier, null);
 });
 
+test("GPA rows normalize exact 900 formats and never fall back from invalid supplied IDs", () => {
+  const targets = [{ name: "Sample Member", schoolId: "900123456", email: "sample@example.edu" }];
+  for (const value of ['"900,123,456"', "900123456.0", "9.00123456E8"]) {
+    const [row] = parseGpaCsv(`Name,GPA,University ID\nSample Member,2.60,${value}\n`);
+    assert.equal(row.schoolId, "900123456");
+    assert.equal(suggestTarget(row, targets), targets[0].email);
+  }
+  const [invalid] = parseGpaCsv("Name,GPA,900 Number,Email\nSample Member,2.60,9.00123E8,sample@example.edu\n");
+  assert.match(invalid.schoolIdIssue, /rounded/);
+  assert.equal(suggestTarget(invalid, targets), "");
+  assert.equal(suggestTarget({ name: "Sample Member", email: targets[0].email, schoolId: "900123456junk" }, targets), "");
+  assert.throws(() => reviewedTierAssignments([{ row: invalid, email: targets[0].email }], targets), /correct the 900/);
+  // Defensive normalization also applies when targets are passed directly.
+  assert.equal(suggestTarget({ name: "Sample Member", schoolId: "900123456.0" },
+    [{ ...targets[0], schoolId: "9.00123456E8" }]), targets[0].email);
+  assert.equal(suggestTarget({ name: "Sample Member", schoolId: "900123456" },
+    [targets[0], { ...targets[0], schoolId: "900,123,456", email: "other@example.edu" }]), "");
+});
+
+test("duplicate source 900 numbers are flagged after normalization before any tier assignment", () => {
+  const rows = parseGpaCsv('Name,GPA,900 Number\nSample Member,2.60,900123456\nOther Member,3.50,"900,123,456"\n');
+  const targets = [{ name: "Sample Member", schoolId: "900123456", email: "sample@example.edu" },
+    { name: "Other Member", schoolId: "900654321", email: "other@example.edu" }];
+  assert.ok(rows.every((row) => /Duplicate 900/.test(row.schoolIdIssue)));
+  assert.ok(rows.every((row) => suggestTarget(row, targets) === ""));
+  assert.throws(() => reviewedTierAssignments(rows.map((row, index) => ({ row, email: targets[index].email })), targets), /correct the 900/);
+});
+
+test("malformed or duplicate roster identifiers block only their targets and cannot fall back to names", () => {
+  const targets = [{ name: "Sample Member", email: "sample@example.edu", schoolId: "", schoolIdIssue: "Roster row 2: use all 9 digits." },
+    { name: "Other Member", email: "other@example.edu", schoolId: "876543210" }];
+  const [row, valid] = parseGpaCsv("Name,GPA,900 Number\nSample Member,2.60,\nOther Member,3.50,876543210\n");
+  assert.equal(suggestTarget(row, targets), "");
+  assert.equal(suggestTarget({ ...row, email: targets[0].email }, targets), "");
+  assert.equal(suggestTarget({ ...row, schoolId: "123456789" }, [{ ...targets[0], schoolId: "123456789" }]), "");
+  assert.equal(suggestTarget(valid, targets), targets[1].email);
+  assert.throws(() => reviewedTierAssignments([{ row, email: targets[0].email }], targets), /connected roster/);
+  assert.deepEqual(reviewedTierAssignments([{ row, email: "skip" }, { row: valid, email: targets[1].email }], targets),
+    [{ email: targets[1].email, tier: 1 }]);
+});
+
 test("Chair-selected rows and reordered columns preserve actual sheet row numbers", () => {
   const sheet = readGpaSheet('Fall GPA sheet\n\nAverage,Family,University ID,Given,Contact\n2.69,Member,900123456,Sample,sample@example.edu\n\n3.50,Person,900999999,Other,other@example.edu\n');
   const mapping = { headerRow: 3, firstDataRow: 4, nameMode: "split",

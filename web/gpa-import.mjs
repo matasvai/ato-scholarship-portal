@@ -1,5 +1,6 @@
 // This module runs in the Chair's browser. GPA and student numbers never enter
 // the tier-assignment API; only roster email and the resulting tier do.
+import { isSchoolIdHeader, parseSchoolId } from "./school-id.mjs";
 const MAX_ROWS = 1000;
 const MAX_COLUMNS = 128;
 const clean = (value) => String(value ?? "").trim();
@@ -86,7 +87,7 @@ export function detectGpaMapping(sheet, headerRow = 1) {
     last: column(headers, ["lastname", "last"]),
     full: column(headers, ["name", "fullname", "membername", "studentname"]),
     gpa: column(headers, ["gpa", "previoussemestergpa", "semestergpa"]),
-    schoolId: column(headers, ["900", "900number", "900id", "student900number", "studentid", "idnumber"]),
+    schoolId: column(headers, headers.filter(isSchoolIdHeader)),
     email: column(headers, ["email", "studentemail", "schoolemail"]),
   };
   return { headerRow, firstDataRow: headerRow + 1,
@@ -109,10 +110,13 @@ export function mapGpaSheet(sheet, mapping) {
     if (!cells.some((cell) => clean(cell))) return [];
     const name = nameMode === "full" ? clean(cells[columns.full]) :
       `${clean(cells[columns.first])} ${clean(cells[columns.last])}`.trim();
+    const rawSchoolId = columns.schoolId < 0 ? "" : clean(cells[columns.schoolId]);
+    const parsedId = parseSchoolId(rawSchoolId);
     return {
       line: index + firstDataRow,
       name,
-      schoolId: columns.schoolId < 0 ? "" : clean(cells[columns.schoolId]),
+      schoolId: parsedId.value,
+      ...(parsedId.status === "invalid" ? { schoolIdIssue: parsedId.reason } : {}),
       email: columns.email < 0 ? "" : clean(cells[columns.email]).toLowerCase(),
       gpa: clean(cells[columns.gpa]),
       tier: tierForGpa(cells[columns.gpa]),
@@ -120,6 +124,14 @@ export function mapGpaSheet(sheet, mapping) {
   });
   if (!result.length) throw Error("No member rows were found with this layout.");
   if (result.length > MAX_ROWS) throw Error("The import exceeds 1,000 members.");
+  const seenNumbers = new Map();
+  for (const row of result) {
+    if (!row.schoolId) continue;
+    if (seenNumbers.has(row.schoolId)) {
+      const first = seenNumbers.get(row.schoolId);
+      first.schoolIdIssue = row.schoolIdIssue = `Duplicate 900 number in sheet rows ${first.line} and ${row.line}. Correct the sheet or skip the duplicate rows.`;
+    } else seenNumbers.set(row.schoolId, row);
+  }
   return result;
 }
 
@@ -133,8 +145,12 @@ export function reviewedTierAssignments(rows, targets) {
   const seen = new Set(), assignments = [];
   for (const item of rows) {
     if (item.email === "skip") continue;
+    if (item.row.schoolIdIssue || parseSchoolId(item.row.schoolId).status === "invalid")
+      throw Error(`Row ${item.row.line || ""}: correct the 900 number in the sheet, or skip that row.`);
     const target = byEmail.get(item.email);
     if (!target) throw Error("Choose a member or skip each unresolved row.");
+    if (target.schoolIdIssue)
+      throw Error("Correct the selected member's student number in the connected roster, or skip that row.");
     if (seen.has(item.email)) throw Error("A member is selected more than once. Skip or correct the duplicate row.");
     seen.add(item.email);
     const tier = target.membership === "new_member" ? 1 : item.row.tier;
@@ -146,18 +162,21 @@ export function reviewedTierAssignments(rows, targets) {
 }
 
 export function suggestTarget(row, targets) {
-  if (row.schoolId) {
-    const byNumber = targets.filter((target) => target.schoolId && target.schoolId === row.schoolId);
+  const eligibleTargets = targets.filter((target) => !target.schoolIdIssue && parseSchoolId(target.schoolId).status !== "invalid");
+  const schoolId = parseSchoolId(row.schoolId);
+  if (row.schoolIdIssue || schoolId.status === "invalid") return "";
+  if (schoolId.status === "valid") {
+    const byNumber = eligibleTargets.filter((target) => parseSchoolId(target.schoolId).value === schoolId.value);
     if (byNumber.length === 1 && nameKey(byNumber[0].name) === nameKey(row.name))
       return byNumber[0].email;
     return "";
   }
   if (row.email) {
-    const byEmail = targets.filter((target) => target.email.toLowerCase() === row.email);
+    const byEmail = eligibleTargets.filter((target) => target.email.toLowerCase() === row.email);
     if (byEmail.length === 1 && nameKey(byEmail[0].name) === nameKey(row.name))
       return byEmail[0].email;
     return "";
   }
-  const byName = targets.filter((target) => nameKey(target.name) === nameKey(row.name));
+  const byName = eligibleTargets.filter((target) => nameKey(target.name) === nameKey(row.name));
   return byName.length === 1 ? byName[0].email : "";
 }

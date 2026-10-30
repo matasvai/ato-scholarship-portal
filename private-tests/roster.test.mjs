@@ -134,7 +134,8 @@ test("Chair-only identifier projection reads column E transiently", async () => 
   });
   assert.equal(calls, 1);
   assert.deepEqual(fetched, rows);
-  assert.throws(() => parseRosterImportIdentifiers(csv.replace("900654321", "900123456")), /duplicate/);
+  const duplicate = parseRosterImportIdentifiers(csv.replace("900654321", "900123456"));
+  assert.ok(duplicate.every((entry) => entry.schoolId === "" && /duplicate/.test(entry.schoolIdIssue)));
 });
 
 test("public CSV rejects ambiguous active rows, malformed exports, and excess rows", () => {
@@ -155,6 +156,40 @@ test("public CSV rejects ambiguous active rows, malformed exports, and excess ro
   ];
   for (const csv of invalid)
     assert.throws(() => parsePublicRosterCsv(csv), (error) => error.status === 503);
+});
+
+test("roster 900 projection validates its source column and compares canonical identifiers", () => {
+  const header = "First Name,Last Name,Status,900 Number,Student Email\n";
+  const csv = header + 'Sample,Member,Active,"900,123,456",sample@example.edu\n' +
+    "New,Member,New Mem.,,new@example.edu\n";
+  const result = parseRosterImportIdentifiers(csv);
+  assert.equal(result.find((row) => row.email === "sample@example.edu").schoolId, "900123456");
+  assert.equal(result.find((row) => row.email === "new@example.edu").schoolId, "");
+  assert.throws(() => parseRosterImportIdentifiers(csv.replace("900 Number", "Phone")), /column E must be labeled/);
+  const invalid = parseRosterImportIdentifiers(header + "Sample,Member,Active,9.00123E8,sample@example.edu\n");
+  assert.equal(invalid[0].schoolId, "");
+  assert.match(invalid[0].schoolIdIssue, /row 2, column E.*rounded/);
+  assert.ok(!invalid[0].schoolIdIssue.includes("9.00123"));
+  const duplicate = parseRosterImportIdentifiers(csv + "Other,Member,Active,9.00123456E8,other@example.edu\n");
+  for (const entry of duplicate.filter((entry) => entry.email !== "new@example.edu")) {
+    assert.equal(entry.schoolId, "");
+    assert.match(entry.schoolIdIssue, /rows 2 and 4, column E.*duplicate student/);
+  }
+  assert.equal(duplicate.find((entry) => entry.email === "new@example.edu").schoolIdIssue, undefined);
+});
+
+test("one incomplete roster student number does not prevent valid members from being imported", () => {
+  const csv = "First Name,Last Name,Status,Student Id,Student Email\n" +
+    "Valid,Member,Active,876543210,valid@example.edu\n" +
+    "Incomplete,Member,Active,87654321,incomplete@example.edu\n" +
+    "Formatted,Member,New Mem.,1.23456789E8,formatted@example.edu\n";
+  const rows = parseRosterImportIdentifiers(csv);
+  assert.equal(rows.find((row) => row.email === "valid@example.edu").schoolId, "876543210");
+  assert.equal(rows.find((row) => row.email === "formatted@example.edu").schoolId, "123456789");
+  const incomplete = rows.find((row) => row.email === "incomplete@example.edu");
+  assert.equal(incomplete.schoolId, "");
+  assert.match(incomplete.schoolIdIssue, /row 3, column E.*9 digits/);
+  assert.ok(!JSON.stringify(rows).includes("87654321\""));
 });
 
 test("public reader fetches only one A,B,C,I projection without credentials", async () => {

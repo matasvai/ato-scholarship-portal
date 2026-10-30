@@ -96,45 +96,58 @@ test('an in-flight API response from a previous session never reaches its view o
   assert.equal(context.logs.length,0);
 });
 
-const inviteSource = extract('function addMember(', '\nfunction editAcademicSettings(');
+const inviteSource = extract('function addMember(', '\nasync function editMemberAccount(');
 function invitationFixture() {
   const request = deferred(), feedback = {textContent:'',innerHTML:''};
-  const back = {disabled:false}, submit = {disabled:false}, checkbox = {disabled:false};
-  const entryForm = {}, confirmForm = {isConnected:true,dataset:{},
-    querySelectorAll:() => [back,submit,checkbox], querySelector:selector => selector === '#form-error' ? feedback : back};
+  const back = {disabled:false}, submit = {disabled:false}, name = {disabled:false};
+  const entryForm = {isConnected:true,dataset:{},
+    querySelectorAll:() => [back,submit,name], querySelector:selector => selector === '#form-error' ? feedback : back};
   const modal = {open:true, close(){this.open=false; context.closes++;}};
   const context = {
-    appConfig:{chapterAuth:{enabled:true,emailReady:true}}, user:{id:'chair'},sessionEpoch:1,
+    appConfig:{chapterAuth:{enabled:true,emailReady:false}}, user:{id:'chair'},sessionEpoch:1,
     esc:value => value ?? '', loading:() => 'loading', modal,
-    FormData:class { constructor(){return [['name','Fictional Member'],['email','fictional@example.test'],['tier','1'],['credits','15']];} },
-    openModal:() => {}, $:selector => ({'#roster-form':entryForm,'#confirm-invitation':confirmForm,'#edit-invitation':back,'#form-error':feedback})[selector],
-    api:() => request.promise, loadInvitationStatus:async () => {context.refreshes++;}, rosterPage:async () => {context.rosterRenders++;},
-    toast:() => {}, closes:0,refreshes:0,rosterRenders:0,
+    FormData:class { constructor(){return [['name','Fictional Member'],['email','fictional@example.test'],['badge',''],['tier','1'],['credits','15']];} },
+    openModal:() => {}, $:selector => ({'#roster-form':entryForm,'#form-error':feedback})[selector],
+    api:(path,options) => {context.requests.push({path,options});return request.promise;}, loadInvitationStatus:async () => {context.refreshes++;}, rosterPage:async () => {context.rosterRenders++;},
+    toast:() => {}, closes:0,refreshes:0,rosterRenders:0,requests:[],
   };
   runInNewContext(`(${inviteSource})`,context)();
-  entryForm.onsubmit({preventDefault(){},target:entryForm});
-  return {context,request,confirmForm,modal,feedback,submit,back,
-    send:() => confirmForm.onsubmit({preventDefault(){},target:confirmForm})};
+  return {context,request,entryForm,modal,feedback,submit,back,
+    send:() => entryForm.onsubmit({preventDefault(){},target:entryForm})};
 }
 
-test('late invitation success refreshes status without closing a replacement dialog', async () => {
+test('account preparation works with email disabled and is single-flight through the no-mail endpoint', async () => {
   const f = invitationFixture(), sent = f.send();
-  f.confirmForm.isConnected = false;
-  f.request.resolve({message:'Accepted'}); await sent;
-  assert.equal(f.context.closes,0);
-  assert.equal(f.context.rosterRenders,0);
-  assert.equal(f.context.refreshes,1);
+  await f.send();
+  assert.equal(f.context.requests.length,1);
+  assert.equal(f.context.requests[0].path,'/api/admin/invitations/prepare');
+  assert.equal(f.context.requests[0].options.method,'POST');
+  assert.equal(f.context.requests[0].options.body.email,'fictional@example.test');
+  assert.equal(f.context.requests[0].options.body.tier,1);
+  assert.equal(f.submit.disabled,true);
+  f.request.resolve({message:'Account prepared. No email sent.'}); await sent;
+  assert.equal(f.context.closes,1);
+  assert.equal(f.context.rosterRenders,1);
 });
 
-test('invitation errors require checking durable status and stale failures do not alter another account', async () => {
+test('late account preparation cannot close a replacement dialog or replace its content', async () => {
   const f = invitationFixture(), sent = f.send();
-  f.request.reject(Error('Delivery uncertain')); await sent;
-  assert.equal(f.submit.disabled,true,'an uncertain send must not immediately expose a retry button');
+  f.entryForm.isConnected = false;
+  f.request.resolve({message:'Prepared'}); await sent;
+  assert.equal(f.context.closes,0);
+  assert.equal(f.context.rosterRenders,0);
+});
+
+test('preparation failures refresh durable status and stale callbacks do not alter another account', async () => {
+  const f = invitationFixture(), sent = f.send();
+  f.request.reject(Error('Preparation interrupted')); await sent;
+  assert.equal(f.submit.disabled,false,'preparation retries cannot send mail');
   assert.equal(f.back.disabled,false);
-  assert.match(f.feedback.textContent,/check Invitation status/);
+  assert.match(f.feedback.textContent,/Preparation interrupted/);
+  assert.equal(f.context.refreshes,1);
   const stale = invitationFixture(), staleSend = stale.send();
   stale.context.user = {id:'member'}; stale.context.sessionEpoch++;
-  stale.request.reject(Error('Delivery uncertain')); await staleSend;
+  stale.request.reject(Error('Preparation interrupted')); await staleSend;
   assert.equal(stale.context.refreshes,0);
   assert.equal(stale.feedback.textContent,'');
 });

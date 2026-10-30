@@ -1604,13 +1604,25 @@ async function loadInvitationStatus() {
   try {
     const {invitations, emailReady} = await api('/api/admin/invitations');
     if (!current()) return;
-    panel.innerHTML = `<div class="section-heading"><h2>INVITATION STATUS</h2><button class="text-btn" data-refresh-invitations type="button">Refresh</button></div><p class="muted">A successful send means the email service accepted the request. Ask the recipient to confirm it arrived.</p>${emailReady ? '' : '<p class="notice info">Email sending is not enabled. You can still check and repair account setup without sending anything.</p>'}${invitations.length ? `<div class="table-wrap"><table><thead><tr><th>Recipient</th><th>Status</th><th>Last sent</th><th>Actions</th></tr></thead><tbody>${invitations.map((item,index) => `<tr><td><strong>${esc(item.name)}</strong><small>${esc(item.email)}</small><code>${esc(item.loginId || '')}</code></td><td>${esc(labels[item.status] || item.status)}<small>${esc(item.message || '')}</small></td><td>${item.lastSentAt ? esc(new Date(item.lastSentAt).toLocaleString()) : '—'}</td><td>${item.canReconcile ? `<button class="table-link" data-invitation-index="${index}" data-operation="reconcile">Check account setup</button>` : ''}${item.canResend && emailReady ? `<button class="table-link" data-invitation-index="${index}" data-operation="resend">Review resend</button>` : item.retryAt > Date.now() ? '<small>Wait one minute, then refresh.</small>' : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p>No invitations have been prepared.</p>'}`;
+    const ready = invitations.filter(item => item.status === 'ready').length;
+    const accepted = invitations.filter(item => item.status === 'sent').length;
+    const attention = invitations.filter(item => ['untracked', 'failed', 'delivery_unknown'].includes(item.status)).length;
+    panel.innerHTML = `<div class="section-heading"><h2>ACCOUNT SETUP & EMAILS</h2><button class="text-btn" data-refresh-invitations type="button">Refresh</button></div><p class="muted">${ready} ready to send · ${accepted} accepted by email service · ${attention} need attention</p><p class="muted">${emailReady ? "Email sending is enabled. Verify delivery with one agreed test recipient before the full rollout." : "Accounts can be prepared before email sending is enabled."} A successful send still needs the recipient to confirm it arrived.</p>${emailReady ? '' : '<p class="notice info">Email sending is not enabled. You can still check and repair account setup without sending anything.</p>'}${invitations.length ? `<div class="invitation-filters"><div class="field"><label for="prepared-search">Find a prepared account</label><input id="prepared-search" type="search" placeholder="Name or email"></div><div class="field"><label for="prepared-status">Email status</label><select id="prepared-status"><option value="all">All accounts</option><option value="ready">Ready to send</option><option value="sent">Accepted by email service</option><option value="attention">Needs attention</option></select></div></div><div class="table-wrap"><table><thead><tr><th>Recipient</th><th>Status</th><th>Last sent</th><th>Actions</th></tr></thead><tbody>${invitations.map((item,index) => `<tr data-prepared-index="${index}"><td><strong>${esc(item.name)}</strong><small>${esc(item.email)}</small><code>${esc(item.loginId || '')}</code></td><td>${esc(labels[item.status] || item.status)}<small>${esc(item.message || '')}</small></td><td>${item.lastSentAt ? esc(new Date(item.lastSentAt).toLocaleString()) : '—'}</td><td>${item.memberId ? `<button class="table-link" data-action="edit-academic-settings" data-id="${esc(item.memberId)}">Edit member</button>` : ""}${item.canReconcile ? `<button class="table-link" data-invitation-index="${index}" data-operation="reconcile">Check account setup</button>` : ''}${item.canResend && emailReady ? `<button class="table-link" data-invitation-index="${index}" data-operation="resend">${item.status === "ready" && !item.lastSentAt ? "Review setup email" : "Review resend"}</button>` : item.retryAt > Date.now() ? '<small>Wait one minute, then refresh.</small>' : ''}</td></tr>`).join('')}</tbody></table></div>` : '<p>No accounts have been prepared. Refresh the roster above, then choose a member.</p>'}`;
     panel.querySelector('[data-refresh-invitations]').onclick = loadInvitationStatus;
+    const search = panel.querySelector('#prepared-search'), status = panel.querySelector('#prepared-status');
+    if (search && status) {
+      const filter = () => panel.querySelectorAll('[data-prepared-index]').forEach(row => {
+        const item = invitations[Number(row.dataset.preparedIndex)];
+        row.hidden = !`${item.name} ${item.email}`.toLowerCase().includes(search.value.trim().toLowerCase()) ||
+          (status.value !== 'all' && (status.value === 'attention' ? !['untracked', 'failed', 'delivery_unknown'].includes(item.status) : item.status !== status.value));
+      });
+      search.oninput = status.onchange = filter;
+    }
     panel.querySelectorAll('[data-invitation-index]').forEach(button => button.onclick = () => {
       const item = invitations[Number(button.dataset.invitationIndex)], operation = button.dataset.operation;
       const resend = operation === 'resend';
-      openModal(resend ? 'SEND ACCOUNT SETUP?' : 'CHECK ACCOUNT SETUP?', '', `<p>${resend ? 'Send a new one-time password setup link to' : 'Check and repair the portal account connection for'} <strong>${esc(item.email)}</strong>?</p><p>${resend ? 'If the earlier delivery was uncertain, check the inbox first. This action sends another email.' : 'This does not send an email or change an existing password.'}</p><form id="invitation-action-form">${resend ? '<label class="checkbox-line"><input type="checkbox" required><span>I checked the recipient and want to send this email now.</span></label>' : ''}<div class="invitation-feedback" role="status"></div><div class="modal-actions"><button class="button ghost" data-action="close" type="button">Cancel</button><button class="button gold" type="submit">${resend ? 'Send setup link' : 'Check account setup'}</button></div></form>`);
-      const form = $('#invitation-action-form');
+      openModal(resend ? 'SEND ACCOUNT SETUP?' : 'CHECK ACCOUNT SETUP?', '', `<p>${resend ? 'Send a new one-time password setup link to' : 'Check and repair the portal account connection for'} <strong>${esc(item.email)}</strong>?</p><p>${resend ? item.status === 'ready' && !item.lastSentAt ? 'The member will receive a one-time link to choose their password.' : 'Check the inbox first if an earlier delivery was uncertain. This action sends another email.' : 'This does not send an email or change an existing password.'}</p><form id="invitation-action-form">${resend ? '<label class="checkbox-line"><input type="checkbox" required><span>I checked the recipient and want to send this email now.</span></label>' : ''}<div class="invitation-feedback" role="status"></div><div class="modal-actions"><button class="button ghost" data-action="close" type="button">Cancel</button><button class="button gold" type="submit">${resend ? 'Send setup link' : 'Check account setup'}</button></div></form>`);
+      const form = $('#invitation-action-form'), owner = user?.id, epoch = sessionEpoch;
       form.onsubmit = async event => {
         event.preventDefault();
         if (form.dataset.pending) return;
@@ -1621,9 +1633,11 @@ async function loadInvitationStatus() {
         feedback.innerHTML = loading(resend ? 'Sending setup link…' : 'Repairing account…', true);
         try {
           const result = await api(`/api/admin/invitations/${encodeURIComponent(item.email)}/${operation}`, {method:'POST',body:{}});
+          if (user?.id !== owner || sessionEpoch !== epoch) return;
           if (!form.isConnected || !modal.open) { await loadInvitationStatus(); return; }
           modal.close(); await rosterPage(); toast(result.message);
         } catch (error) {
+          if (user?.id !== owner || sessionEpoch !== epoch || !form.isConnected) return;
           feedback.textContent = `${error.message} Close this window and refresh invitation status before trying again.`;
           form.querySelector('[data-action="close"]').disabled = false;
           loadInvitationStatus();
@@ -1654,9 +1668,9 @@ async function loadRosterSync() {
       ? `Last successful refresh: ${esc(new Date(result.fetchedAt).toLocaleString())}. ${result.activeCount} eligible ${emailMode ? `members (${result.newMemberCount || 0} new)` : "IDs"}.`
       : "Connect the sheet in the hosting settings to enable automatic eligibility checks.";
     const candidateList = emailMode && result.fresh
-      ? `<div class="section-heading" style="margin-top:22px"><h3>INVITATION RECIPIENTS</h3><span class="muted">${rosterCandidates.length} of ${result.activeCount} eligible members</span></div>${rosterCandidates.length
-        ? `<p class="muted">New roster entries appear here after refresh. No email is sent until you review and confirm an invitation.</p><div class="invitation-filters"><div class="field"><label for="invite-search">Find a recipient</label><input id="invite-search" type="search" placeholder="Name or email"></div><div class="field"><label for="invite-membership">Membership</label><select id="invite-membership"><option value="all">All eligible members</option><option value="new_member">New members</option><option value="active">Active members</option></select></div></div><p id="invite-visible-count" class="muted"></p><div class="table-wrap"><table class="roster-candidate-table"><thead><tr><th>Member</th><th>Status</th><th>University email</th><th>Tier</th><th></th></tr></thead><tbody>${rosterCandidates.map((entry, index) => `<tr data-candidate-index="${index}"><td><strong>${esc(entry.name)}</strong></td><td>${entry.membership === "new_member" ? "New member" : "Active"}</td><td>${esc(entry.email)}</td><td>${entry.assignedTier ? `Tier ${entry.assignedTier}` : "Needs assignment"}</td><td><button class="table-link" data-action="invite-roster-member" data-index="${index}" ${appConfig.chapterAuth?.emailReady ? "" : "disabled"}>Review invitation</button></td></tr>`).join("")}</tbody></table></div>`
-        : '<p class="muted">No eligible roster entries need a new invitation.</p>'}${needsAttention ? `<p class="muted">${needsAttention} existing ${needsAttention === 1 ? "account needs" : "accounts need"} attention in the member table below.</p>` : ""}${appConfig.chapterAuth?.emailReady ? "" : '<p class="muted">Email delivery must be configured before invitations can be sent.</p>'}`
+      ? `<div class="section-heading" style="margin-top:22px"><h3>MEMBERS TO PREPARE</h3><span class="muted">${rosterCandidates.length} of ${result.activeCount} eligible members</span></div>${rosterCandidates.length
+        ? `<p class="muted">Prepare accounts and check their details here. Send setup emails separately from the account list below.</p><div class="invitation-filters"><div class="field"><label for="invite-search">Find a recipient</label><input id="invite-search" type="search" placeholder="Name or email"></div><div class="field"><label for="invite-membership">Membership</label><select id="invite-membership"><option value="all">All eligible members</option><option value="new_member">New members</option><option value="active">Active members</option></select></div></div><p id="invite-visible-count" class="muted"></p><div class="table-wrap"><table class="roster-candidate-table"><thead><tr><th>Member</th><th>Status</th><th>University email</th><th>Tier</th><th></th></tr></thead><tbody>${rosterCandidates.map((entry, index) => `<tr data-candidate-index="${index}"><td><strong>${esc(entry.name)}</strong></td><td>${entry.membership === "new_member" ? "New member" : "Active"}</td><td>${esc(entry.email)}</td><td>${entry.assignedTier ? `Tier ${entry.assignedTier}` : "Needs assignment"}</td><td><button class="table-link" data-action="invite-roster-member" data-index="${index}">Edit / prepare account</button></td></tr>`).join("")}</tbody></table></div>`
+        : '<p class="muted">Every eligible roster entry already has an account.</p>'}${needsAttention ? `<p class="muted">${needsAttention} existing ${needsAttention === 1 ? "account needs" : "accounts need"} attention in the member table below.</p>` : ""}${appConfig.chapterAuth?.emailReady ? "" : '<p class="muted">Email delivery must be configured before invitations can be sent.</p>'}`
       : "";
     panel.innerHTML = `<div class="section-heading"><h2>ROSTER SHEET</h2><span class="status ${result.fresh ? "approved" : "pending"}">${result.fresh ? "Up to date" : result.required ? "Refresh required" : "Not connected"}</span></div><p>${description}</p><p class="muted">${count} Members need a successful refresh at least every 15 minutes. Chair access remains available for recovery.</p>${result.lastError ? `<p class="error">${esc(result.lastError)}</p>` : ""}<button class="button ghost" id="sync-roster" ${result.configured ? "" : "disabled"}>Refresh roster now</button>${candidateList}`;
     const search = panel.querySelector("#invite-search"), membership = panel.querySelector("#invite-membership");
@@ -1816,45 +1830,34 @@ async function updateSemesterState() {
 }
 function addMember(prefill = {}) {
   if (appConfig.chapterAuth?.enabled) {
-    if (!appConfig.chapterAuth.emailReady) {
-      openModal("MEMBER INVITATIONS ARE NOT READY", "Chapter email delivery has not been configured.",
-        '<p>Set up and test chapter email before sending invitations. No account invitation was sent.</p><div class="modal-actions"><button class="button gold" data-action="close">Close</button></div>');
-      return;
-    }
-    openModal("ADD A CHAPTER MEMBER", "An invitation will be emailed. The member chooses their own password.",
-      `<form id="roster-form"><div class="form-grid"><div class="field"><label for="member-name">Name</label><input id="member-name" name="name" required maxlength="100" value="${esc(prefill.name || "")}"></div><div class="field"><label for="member-email">Email for account setup</label><input id="member-email" name="email" type="email" required value="${esc(prefill.email || "")}"></div><div class="field"><label for="member-badge">Badge number (optional)</label><input id="member-badge" name="badge" maxlength="32" value="${esc(prefill.badge || "")}"><small>New members receive a portal sign-in ID automatically.</small></div><div class="field"><label for="member-tier">Assigned tier</label><select id="member-tier" name="tier">${[1, 2, 3, 4, 5].map((t) => `<option value="${t}"${Number(prefill.assignedTier) === t ? " selected" : ""}>${t}</option>`).join("")}</select><small>${prefill.membership === "new_member" ? "New members use Tier 1." : prefill.assignedTier ? "From the Chair's reviewed GPA import." : "Use the page-5 GPA ranges."}</small></div><div class="field"><label for="member-credits">Enrolled credits</label><input id="member-credits" name="credits" type="number" min="0" max="30" required value="${esc(prefill.credits ?? 15)}"></div></div><div id="form-error" role="alert"></div><div class="modal-actions"><button class="button ghost" type="button" data-action="close">Cancel</button><button class="button gold" type="submit">Review invitation</button></div></form>`);
+    openModal("PREPARE MEMBER ACCOUNT", "Save the account now. Send its setup link separately when ready.",
+      `<form id="roster-form"><div class="form-grid"><div class="field"><label for="member-name">Name</label><input id="member-name" name="name" required maxlength="100" value="${esc(prefill.name || "")}"></div><div class="field"><label for="member-email">Email for account setup</label><input id="member-email" name="email" type="email" required value="${esc(prefill.email || "")}"></div><div class="field"><label for="member-badge">Badge number (optional)</label><input id="member-badge" name="badge" maxlength="32" value="${esc(prefill.badge || "")}"><small>Use a chapter badge number, not a university 900 number. New members receive a portal sign-in ID automatically.</small></div><div class="field"><label for="member-tier">Assigned tier</label><select id="member-tier" name="tier"${prefill.membership === "new_member" ? " disabled" : ""}>${[1, 2, 3, 4, 5].map((t) => `<option value="${t}"${Number(prefill.membership === "new_member" ? 1 : prefill.assignedTier) === t ? " selected" : ""}>${t}</option>`).join("")}</select><small>${prefill.membership === "new_member" ? "New members use Tier 1." : prefill.assignedTier ? "From the Chair's reviewed GPA import." : "Use the page-5 GPA ranges."}</small></div><div class="field"><label for="member-credits">Enrolled credits</label><input id="member-credits" name="credits" type="number" min="0" max="30" required value="${esc(prefill.credits ?? 15)}"></div></div><div id="form-error" role="alert"></div><div class="modal-actions"><button class="button ghost" type="button" data-action="close">Cancel</button><button class="button gold" type="submit">Save without sending email</button></div></form>`);
     $("#roster-form").onsubmit = async (event) => {
       event.preventDefault();
-      const body = Object.fromEntries(new FormData(event.target));
-      body.tier = Number(body.tier);
+      const form = event.target, owner = user?.id, epoch = sessionEpoch;
+      if (form.dataset.pending) return;
+      const body = Object.fromEntries(new FormData(form));
+      body.tier = prefill.membership === "new_member" ? 1 : Number(body.tier);
       body.credits = Number(body.credits);
-      openModal("REVIEW INVITATION", "Nothing has been sent yet.",
-        `<dl class="details"><div><dt>Recipient</dt><dd>${esc(body.name)}</dd></div><div><dt>To</dt><dd>${esc(body.email)}</dd></div><div><dt>Tier / credits</dt><dd>Tier ${body.tier} · ${body.credits} credits</dd></div><div><dt>Sign-in ID</dt><dd>${esc(body.badge || "Assigned automatically")}</dd></div></dl><p>This sends the account-setup email with a one-time link to choose a password. It does not send a temporary password. The email wording is managed in the account setup/reset email template.</p><form id="confirm-invitation"><label class="checkbox-line"><input type="checkbox" required><span>I checked this recipient and want to send this invitation now.</span></label><div id="form-error" role="alert"></div><div class="modal-actions"><button id="edit-invitation" class="button ghost" type="button">Back</button><button class="button gold" type="submit">Send invitation to this member</button></div></form>`);
-      $("#edit-invitation").onclick = () => addMember({ ...prefill, ...body, assignedTier: body.tier });
-      $("#confirm-invitation").onsubmit = async confirmEvent => {
-        confirmEvent.preventDefault();
-        const form = confirmEvent.target, owner = user?.id, epoch = sessionEpoch;
-        const buttons = [...form.querySelectorAll("button,input")];
-        if (form.dataset.sending) return;
-        form.dataset.sending = "true";
-        buttons.forEach(button => button.disabled = true);
-        $("#form-error").innerHTML = loading("Sending invitation…", true);
-        try {
-          const result = await api("/api/roster", { method: "POST", body });
-          if (user?.id !== owner || sessionEpoch !== epoch) return;
-          if (!form.isConnected || !modal.open) { await loadInvitationStatus(); return; }
-          modal.close();
-          await rosterPage();
-          toast(result.message || `Account prepared. Sign-in ID: ${result.loginId}`);
-        } catch (error) {
-          if (user?.id !== owner || sessionEpoch !== epoch) return;
-          if (form.isConnected && modal.open) {
-            form.querySelector("#form-error").textContent = `${error.message} Close this window and check Invitation status before trying again.`;
-            form.querySelector('#edit-invitation').disabled = false;
-          }
-          loadInvitationStatus();
-        }
-      };
+      form.dataset.pending = "true";
+      const controls = [...form.querySelectorAll("input,select,button")];
+      const disabled = controls.map(control => control.disabled);
+      controls.forEach(control => control.disabled = true);
+      form.querySelector("#form-error").innerHTML = loading("Preparing account…", true);
+      try {
+        const result = await api("/api/admin/invitations/prepare", { method: "POST", body });
+        if (user?.id !== owner || sessionEpoch !== epoch) return;
+        if (!form.isConnected || !modal.open) return;
+        modal.close();
+        await rosterPage();
+        toast(result.message || "Account saved. No email sent.");
+      } catch (error) {
+        if (user?.id !== owner || sessionEpoch !== epoch || !form.isConnected) return;
+        form.querySelector("#form-error").textContent = error.message;
+        delete form.dataset.pending;
+        controls.forEach((control, index) => control.disabled = disabled[index]);
+        loadInvitationStatus();
+      }
     };
     return;
   }
@@ -1877,6 +1880,47 @@ function addMember(prefill = {}) {
       formError(err.message);
     }
   };
+}
+async function editMemberAccount(member) {
+  if (user?.role !== "chair") return;
+  if (!appConfig.chapterAuth?.enabled || isDemo()) return editAcademicSettings(member);
+  const owner = user.id, epoch = sessionEpoch;
+  let cancelled = false;
+  const current = () => !cancelled && modal.open && user?.id === owner && sessionEpoch === epoch;
+  openModal("MANAGE MEMBER", "", loading("Loading account details…"));
+  modal.addEventListener("close", () => { cancelled = true; }, { once: true });
+  try {
+    const details = await api(`/api/roster/${encodeURIComponent(member.id)}/account-settings`);
+    if (!current()) return;
+    const saved = details.member;
+    openModal("MANAGE MEMBER", "Save account changes without sending an email.",
+      `<form id="member-account-form"><div class="form-grid"><div class="field"><label for="account-member-name">Name</label><input id="account-member-name" name="name" required maxlength="100" value="${esc(saved.name)}"></div><div class="field"><label for="account-member-email">Account email</label><input id="account-member-email" type="email" readonly value="${esc(saved.email)}"><small>This email identifies the member’s sign-in account. Contact the portal operator if it needs correcting.</small></div><div class="field"><label for="account-member-badge">Badge number (optional)</label><input id="account-member-badge" name="badge" maxlength="32" value="${esc(details.badge || "")}"><small>Chapter badge number, not the university 900 number. Portal ID: ${esc(details.loginId || "—")}.</small></div><div class="field"><label for="account-member-tier">Assigned tier</label><select id="account-member-tier" name="tier"${details.membership === "new_member" ? " disabled" : ""}>${[1, 2, 3, 4, 5].map(tier => `<option value="${tier}"${saved.tier === tier ? " selected" : ""}>Tier ${tier} · ${rules.checkpoints.at(-1).targets[tier - 1]}-point goal</option>`).join("")}</select>${details.membership === "new_member" ? "<small>New members use Tier 1.</small>" : ""}</div><div class="field"><label for="account-member-credits">Enrolled credits</label><input id="account-member-credits" name="credits" type="number" min="0" max="30" step="any" required value="${esc(saved.credits)}"${details.creditsManaged ? " readonly" : ""}><small>${details.creditsManaged ? "Total from approved classes. Review their classes to change it." : "Replaced by approved class hours once classes are reviewed."}</small></div></div><p><button class="table-link" type="button" data-action="adjust-points" data-id="${esc(saved.id)}">Adjust approved points</button></p><div id="form-error" role="alert"></div><div class="modal-actions"><button type="button" class="button ghost" data-action="close">Cancel</button><button type="submit" class="button gold">Save changes</button></div></form>`);
+    const form = $("#member-account-form");
+    form.onsubmit = async event => {
+      event.preventDefault();
+      if (form.dataset.pending) return;
+      const body = { name: $("#account-member-name").value, badge: $("#account-member-badge").value,
+        tier: Number($("#account-member-tier").value), credits: Number($("#account-member-credits").value), version: details.version };
+      const controls = [...form.querySelectorAll("input,select,button")];
+      const disabled = controls.map(control => control.disabled);
+      form.dataset.pending = "true";
+      controls.forEach(control => control.disabled = true);
+      form.querySelector("#form-error").innerHTML = loading("Saving account…", true);
+      try {
+        await api(`/api/roster/${encodeURIComponent(saved.id)}/account-settings`, { method: "POST", body });
+        if (!current() || !form.isConnected) return;
+        modal.close();
+        await refresh();
+        if (location.hash === "#roster") await rosterPage(); else render();
+        toast("Member updated. No email sent.");
+      } catch (error) {
+        if (!current() || !form.isConnected) return;
+        form.querySelector("#form-error").textContent = error.message;
+        delete form.dataset.pending;
+        controls.forEach((control, index) => control.disabled = disabled[index]);
+      }
+    };
+  } catch (error) { if (current()) formError(error.message); }
 }
 function editAcademicSettings(member) {
   if (user?.role !== "chair") return;
@@ -1918,12 +1962,16 @@ function createPilotAccounts() {
 async function openTierImport() {
   if (user?.role !== "chair") return;
   const owner = user.id, epoch = sessionEpoch;
-  let sheet = null, rows = [], targets = [], cancelled = false, fileVersion = 0;
+  let sheet = null, rows = [], targets = [], cancelled = false, fileVersion = 0, sheetVersion = 0;
+  let workbook = null, workbookAbort = null;
   const current = () => !cancelled && modal.open && user?.id === owner && sessionEpoch === epoch;
   modal.classList.add("tier-import-dialog");
   openModal("IMPORT GPA TIERS", "Scholarship Chair only", loading("Loading the eligible roster…"));
   modal.addEventListener("close", () => {
     cancelled = true;
+    workbookAbort?.abort();
+    workbook?.close();
+    workbook = null;
     sheet = null;
     rows = [];
     targets = [];
@@ -1938,11 +1986,12 @@ async function openTierImport() {
     const { readGpaSheet, gpaColumnChoices, detectGpaMapping, mapGpaSheet, suggestTarget, nameKey, reviewedTierAssignments } = helpers;
     targets = view.targets.filter((entry) => entry.accountStatus !== "inactive");
     const targetByEmail = new Map(targets.map((entry) => [entry.email, entry]));
+    const rosterIdIssues = targets.filter(entry => entry.schoolIdIssue);
     const fields = [["gpa", "GPA column"], ["schoolId", "900 number column"],
       ["first", "First name"], ["last", "Last name"], ["full", "Full name"], ["email", "Email (optional)"]];
     const columnField = ([key, label]) => `<div class="field" data-gpa-field="${key}"><label for="gpa-column-${key}">${label}</label><select id="gpa-column-${key}"${["gpa", "schoolId"].includes(key) ? ` aria-describedby="gpa-column-${key}-hint"` : ""}></select>${["gpa", "schoolId"].includes(key) ? `<small id="gpa-column-${key}-hint"></small>` : ""}</div>`;
     openModal("IMPORT GPA TIERS", "Choose the sheet layout, preview the results, then apply",
-      `<p class="footnote">Choose a CSV export from the GPA sheet. GPA and 900 numbers stay in this import session; only the reviewed tiers are saved.</p><div class="field"><label for="gpa-csv">GPA sheet CSV</label><input id="gpa-csv" type="file" accept=".csv,text/csv"><small>Google Sheets: File → Download → Comma-separated values (.csv).</small></div><section id="gpa-layout" class="import-layout" hidden><h3>CHOOSE COLUMNS</h3><p class="footnote">Select the GPA and 900 number columns using their spreadsheet letters or header names.</p><div class="form-grid">${fields.slice(0, 2).map(columnField).join("")}<div class="field"><label for="gpa-header-row">Header row</label><input id="gpa-header-row" type="number" min="0" max="1000" value="1"><small>Use 0 if the sheet has no header.</small></div><div class="field"><label for="gpa-first-row">First member row</label><input id="gpa-first-row" type="number" min="1" max="1100" value="2"></div><div class="field span2"><label for="gpa-name-mode">Names are stored as</label><select id="gpa-name-mode"><option value="split">Separate first and last names</option><option value="full">One full-name column</option></select></div>${fields.slice(2).map(columnField).join("")}</div><div id="gpa-layout-sample" class="import-layout-sample"></div><div class="heading-actions"><button class="button ghost small" id="detect-gpa-columns" type="button">Match header names</button><button class="button ghost small" id="save-gpa-layout" type="button">Save layout for next time</button><button class="button gold small" id="preview-gpa-tiers" type="button">Preview tiers</button></div></section><div id="gpa-import-preview"></div><p id="gpa-import-status" role="status"></p><label id="gpa-confirm-label" class="recovery-confirm" hidden><input type="checkbox" id="gpa-confirm"> I checked the member matches and proposed tiers.</label><div id="form-error" role="alert"></div><div class="modal-actions"><button class="button ghost" type="button" data-action="close">Cancel</button><button class="button gold" type="button" id="apply-gpa-tiers" disabled>Apply reviewed tiers</button></div>`);
+      `<p class="footnote">Choose an Excel workbook or CSV file. GPA and 900 numbers stay in this import session; only the reviewed tiers are saved.</p>${rosterIdIssues.length ? `<div class="notice info"><strong>${rosterIdIssues.length} roster ${rosterIdIssues.length === 1 ? "entry needs" : "entries need"} a student ID correction</strong><p>Other members can still be imported. Correct these rows in the roster, refresh it, and reopen the import.</p><ul>${rosterIdIssues.map(entry => `<li>${esc(entry.name)}: ${esc(entry.schoolIdIssue)}</li>`).join("")}</ul></div>` : ""}<div class="field"><label for="gpa-csv">GPA spreadsheet</label><input id="gpa-csv" type="file" accept=".xlsx,.xls,.xlx,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv"><small>Excel (.xlsx or .xls), up to 5 MB; CSV, up to 1 MB. Google Sheets: File → Download → Microsoft Excel (.xlsx).</small></div><div id="gpa-worksheet-field" class="field" hidden><label for="gpa-worksheet">Worksheet</label><select id="gpa-worksheet"></select><small>Select the worksheet containing this semester’s GPA list.</small></div><section id="gpa-layout" class="import-layout" hidden><h3>CHOOSE COLUMNS</h3><p class="footnote">Select the GPA and 900 number columns using their spreadsheet letters or header names.</p><div class="form-grid">${fields.slice(0, 2).map(columnField).join("")}<div class="field"><label for="gpa-header-row">Header row</label><input id="gpa-header-row" type="number" min="0" max="1000" value="1"><small>Use 0 if the sheet has no header.</small></div><div class="field"><label for="gpa-first-row">First member row</label><input id="gpa-first-row" type="number" min="1" max="1100" value="2"></div><div class="field span2"><label for="gpa-name-mode">Names are stored as</label><select id="gpa-name-mode"><option value="split">Separate first and last names</option><option value="full">One full-name column</option></select></div>${fields.slice(2).map(columnField).join("")}</div><div id="gpa-layout-sample" class="import-layout-sample"></div><div class="heading-actions"><button class="button ghost small" id="detect-gpa-columns" type="button">Match header names</button><button class="button ghost small" id="save-gpa-layout" type="button">Save layout for next time</button><button class="button gold small" id="preview-gpa-tiers" type="button">Preview tiers</button></div></section><div id="gpa-import-preview"></div><p id="gpa-import-status" role="status"></p><label id="gpa-confirm-label" class="recovery-confirm" hidden><input type="checkbox" id="gpa-confirm"> I checked the member matches and proposed tiers.</label><div id="form-error" role="alert"></div><div class="modal-actions"><button class="button ghost" type="button" data-action="close">Cancel</button><button class="button gold" type="button" id="apply-gpa-tiers" disabled>Apply reviewed tiers</button></div>`);
     const layout = $("#gpa-layout"), preview = $("#gpa-import-preview"), statusLine = $("#gpa-import-status"),
       apply = $("#apply-gpa-tiers"), fileInput = $("#gpa-csv"), confirmed = $("#gpa-confirm");
     const clearError = () => { $("#form-error").textContent = ""; };
@@ -2004,7 +2053,8 @@ async function openTierImport() {
       const unresolved = rows.filter((item) => !item.email).length;
       const invalid = selected.filter((item) => !selectedTier(item)).length;
       const skipped = rows.filter((item) => item.email === "skip").length;
-      statusLine.textContent = `${selected.length} selected · ${unresolved} need a match · ${skipped} skipped${duplicate ? " · duplicate member selected" : ""}${invalid ? ` · ${invalid} invalid GPA` : ""}.`;
+      const invalidIds = rows.filter((item) => item.email !== "skip" && item.row.schoolIdIssue).length;
+      statusLine.textContent = `${selected.length} selected · ${unresolved} need a match · ${skipped} skipped${duplicate ? " · duplicate member selected" : ""}${invalid ? ` · ${invalid} invalid GPA` : ""}${invalidIds ? ` · ${invalidIds} 900 numbers need correction or skipping` : ""}.`;
       $("#gpa-confirm-label").hidden = false;
       preview.innerHTML = `<p class="footnote">Page 5: 3.50+ → Tier 1 · 3.00–3.49 → Tier 2 · 2.70–2.99 → Tier 3 · 2.50–2.69 → Tier 4 · below 2.50 → Tier 5. New members use Tier 1.</p><div class="table-wrap tier-import-table"><table><thead><tr><th>Sheet row</th><th>GPA</th><th>Roster match</th><th>Tier change</th></tr></thead><tbody>${rows.map((item, index) => {
         const target = targetByEmail.get(item.email);
@@ -2014,29 +2064,79 @@ async function openTierImport() {
           const nameMatches = nameKey(target.name) === nameKey(item.row.name);
           note = item.row.schoolId ? numberMatches ? nameMatches ? "900 and name match" : "900 matches; review the different name" : "Selected member's 900 differs—review this match" : nameMatches ? "Name match; no 900 supplied" : "Names differ—review this match";
         }
+        if (item.row.schoolIdIssue) note = item.row.schoolIdIssue;
         const oldTier = target?.currentTier ?? target?.stagedTier;
-        return `<tr><td><strong>${esc(item.row.name || `Row ${item.row.line}`)}</strong><small>Row ${item.row.line}${item.row.schoolId ? ` · 900 ending ${esc(item.row.schoolId.slice(-4))}` : ""}</small><small>${esc(note)}</small></td><td>${esc(item.row.gpa || "—")}</td><td><label class="sr-only" for="gpa-match-${index}">Roster match for ${esc(item.row.name || `row ${item.row.line}`)}</label><select id="gpa-match-${index}" class="gpa-match" data-index="${index}"><option value=""${!item.email ? " selected" : ""}>Choose member</option><option value="skip"${item.email === "skip" ? " selected" : ""}>Skip this row</option>${targets.map((entry) => `<option value="${esc(entry.email)}"${item.email === entry.email ? " selected" : ""}>${esc(entry.name)} · ${esc(entry.email)}</option>`).join("")}</select>${target?.membership === "new_member" ? '<small>New member · Tier 1</small>' : ""}</td><td>${item.email === "skip" ? "Skipped" : selectedTier(item) ? `${oldTier ? `Tier ${oldTier}` : "Unassigned"} → Tier ${selectedTier(item)}` : "Check GPA"}</td></tr>`;
+        return `<tr><td><strong>${esc(item.row.name || `Row ${item.row.line}`)}</strong><small>Row ${item.row.line}${item.row.schoolId ? ` · 900 ending ${esc(item.row.schoolId.slice(-4))}` : ""}</small><small>${esc(note)}</small></td><td>${esc(item.row.gpa || "—")}</td><td><label class="sr-only" for="gpa-match-${index}">Roster match for ${esc(item.row.name || `row ${item.row.line}`)}</label><select id="gpa-match-${index}" class="gpa-match" data-index="${index}"><option value=""${!item.email ? " selected" : ""}>Choose member</option><option value="skip"${item.email === "skip" ? " selected" : ""}>Skip this row</option>${targets.map((entry) => `<option value="${esc(entry.email)}"${item.email === entry.email ? " selected" : ""}${entry.schoolIdIssue ? " disabled" : ""}>${esc(entry.name)} · ${esc(entry.email)}${entry.schoolIdIssue ? " · Fix roster ID first" : ""}</option>`).join("")}</select>${target?.membership === "new_member" ? '<small>New member · Tier 1</small>' : ""}</td><td>${item.email === "skip" ? "Skipped" : item.row.schoolIdIssue ? "Correct student ID" : !target ? "Choose member" : selectedTier(item) ? `${oldTier ? `Tier ${oldTier}` : "Unassigned"} → Tier ${selectedTier(item)}` : "Check GPA"}</td></tr>`;
       }).join("")}</tbody></table></div>`;
       updateApply();
     }
-    fileInput.onchange = async () => {
-      const version = ++fileVersion;
+    const worksheetField = $("#gpa-worksheet-field"), worksheetSelect = $("#gpa-worksheet");
+    function loadSheet(parsed, useSavedMapping = false) {
+      sheet = parsed;
+      layout.hidden = false;
+      const mapping = useSavedMapping && view.mapping;
+      showLayout(mapping || detectGpaMapping(sheet));
+      clearError();
+      statusLine.textContent = `${sheet.rows.length} sheet rows read. ${mapping ? "Saved column choices loaded; check them for this sheet." : "Choose or check the GPA and 900 number columns."} Preview tiers before applying.${sheet.warnings?.length ? ` ${sheet.warnings.join(" ")}` : ""}`;
+    }
+    async function selectWorksheet(useSavedMapping = false) {
+      const version = fileVersion, revision = ++sheetVersion, source = workbook;
       invalidatePreview();
+      clearError();
       sheet = null;
       layout.hidden = true;
-      statusLine.innerHTML = loading("Reading the CSV in this browser…", true);
+      statusLine.innerHTML = loading("Reading the worksheet in this browser…", true);
+      try {
+        const parsed = await source.readSheet(Number(worksheetSelect.value));
+        if (!current() || version !== fileVersion || revision !== sheetVersion) return;
+        loadSheet(parsed, useSavedMapping);
+      } catch (error) {
+        if (current() && version === fileVersion && revision === sheetVersion) {
+          statusLine.textContent = "";
+          formError(error.message);
+        }
+      }
+    }
+    worksheetSelect.onchange = () => selectWorksheet(false);
+    fileInput.onchange = async () => {
+      const version = ++fileVersion;
+      ++sheetVersion;
+      workbookAbort?.abort();
+      workbook?.close();
+      workbook = null;
+      invalidatePreview();
+      clearError();
+      sheet = null;
+      layout.hidden = true;
+      worksheetField.hidden = true;
+      worksheetSelect.replaceChildren();
+      statusLine.innerHTML = loading("Reading the spreadsheet in this browser…", true);
       try {
         const file = fileInput.files?.[0];
-        if (!file || file.size > 1_000_000) throw Error("Choose a CSV file under 1 MB.");
-        const parsed = readGpaSheet(await file.text());
-        if (!current() || version !== fileVersion) return;
-        sheet = parsed;
-        fileInput.value = "";
-        layout.hidden = false;
-        showLayout(view.mapping || detectGpaMapping(sheet));
-        clearError();
-        statusLine.textContent = `${sheet.rows.length} sheet rows read. ${view.mapping ? "Saved column choices loaded; check them for this sheet." : "Choose or check the GPA and 900 number columns."} Preview tiers before applying.`;
-      } catch (error) { if (current() && version === fileVersion) { statusLine.textContent = ""; formError(error.message); } }
+        if (!file) throw Error("Choose an Excel workbook or CSV file.");
+        const extension = (file.name || "gpa.csv").split(".").at(-1).toLowerCase();
+        if (extension === "csv") {
+          if (file.size > 1_000_000) throw Error("Choose a CSV file under 1 MB.");
+          const parsed = readGpaSheet(await file.text());
+          if (!current() || version !== fileVersion) return;
+          loadSheet(parsed, true);
+        } else if (["xlsx", "xls", "xlx"].includes(extension)) {
+          if (file.size > 5 * 1024 * 1024) throw Error("Choose an Excel workbook under 5 MB.");
+          const { openGpaWorkbook } = await import("/gpa-workbook.mjs");
+          if (!current() || version !== fileVersion) return;
+          workbookAbort = new AbortController();
+          const opened = await openGpaWorkbook(file, { signal: workbookAbort.signal });
+          if (!current() || version !== fileVersion) { opened.close(); return; }
+          workbook = opened;
+          worksheetSelect.innerHTML = workbook.sheets.map((entry, index) =>
+            `<option value="${index}">${esc(entry.name)}${entry.hidden ? " (hidden)" : ""}</option>`).join("");
+          worksheetSelect.value = String(Math.max(0, workbook.sheets.findIndex(entry => !entry.hidden)));
+          worksheetField.hidden = false;
+          await selectWorksheet(true);
+        } else throw Error("Choose an Excel (.xlsx or .xls) workbook or a CSV file.");
+      } catch (error) {
+        if (current() && version === fileVersion) { statusLine.textContent = ""; formError(error.message); }
+      } finally { if (current() && version === fileVersion) fileInput.value = ""; }
     };
     layout.onchange = (event) => {
       if (!sheet) return;
@@ -2159,7 +2259,7 @@ document.addEventListener("click", async (e) => {
     else if (b.dataset.action === "edit-academic-settings") {
       const member = rosterAccounts.find((entry) => entry.id === b.dataset.id) || roster.find((entry) => entry.id === b.dataset.id);
       if (member?.role === "member" && member.active !== false && member.active !== 0)
-        editAcademicSettings(member);
+        await editMemberAccount(member);
     }
     else if (b.dataset.action === "reset-member-password") {
       openModal("SEND PASSWORD RESET?", "A reset link will go to this member’s approved email. You will not see their password.",

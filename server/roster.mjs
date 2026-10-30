@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { importPKCS8, SignJWT } from "jose";
+import { isSchoolIdHeader, parseSchoolId } from "../web/school-id.mjs";
 
 const MAX_ROWS = 1000;
 const MAX_BYTES = 256 * 1024;
@@ -225,24 +226,36 @@ export function parseRosterImportIdentifiers(csv) {
     ["first name", "last name", "status", "student email"].some((header, index) =>
       cleanCell(rows[0][index < 3 ? index : 4]).toLowerCase() !== header))
     throw rosterError("Roster import columns do not match the connected sheet.");
-  const seenEmails = new Set(), seenNumbers = new Set(), directory = [];
-  for (const cells of rows.slice(1)) {
+  if (!isSchoolIdHeader(rows[0][3]))
+    throw rosterError("Roster column E must be labeled 900 Number or Student ID. Check the connected sheet before importing tiers.");
+  const seenEmails = new Set(), seenNumbers = new Map(), directory = [];
+  for (const [index, cells] of rows.slice(1).entries()) {
     if (cells.length > 5) throw rosterError("Roster import contains an invalid row.");
-    const [first = "", last = "", status = "", schoolId = "", email = ""] = cells.map(cleanCell);
+    const [first = "", last = "", status = "", rawSchoolId = "", email = ""] = cells.map(cleanCell);
     const membership = status.toLowerCase().replace(/\s+/g, " ");
     if (!["active", "new mem.", "new member"].includes(membership)) continue;
     const normalizedEmail = email.toLowerCase();
+    const parsedId = parseSchoolId(rawSchoolId);
+    const schoolId = parsedId.value;
     if (!first || !last || !/^[^\s@,<>"()]+@[^\s@,<>"()]+\.[^\s@,<>"()]+$/.test(normalizedEmail) ||
       normalizedEmail.length > 254 || first.length > 100 || last.length > 100 ||
-      schoolId.length > 32 || /[\u0000-\u001f\u007f]/.test(`${first}${last}${schoolId}`) ||
-      seenEmails.has(normalizedEmail) || (schoolId && seenNumbers.has(schoolId)))
+      /[\u0000-\u001f\u007f]/.test(`${first}${last}`) ||
+      seenEmails.has(normalizedEmail))
       throw rosterError("Roster import has a missing or duplicate eligible identity.");
     seenEmails.add(normalizedEmail);
-    if (schoolId) seenNumbers.add(schoolId);
-    directory.push({ name: `${first.replace(/\s+/g, " ")} ${last.replace(/\s+/g, " ")}`,
+    const entry = { name: `${first.replace(/\s+/g, " ")} ${last.replace(/\s+/g, " ")}`,
       email: normalizedEmail,
       membership: membership === "active" ? "active" : "new_member",
-      schoolId });
+      schoolId,
+      ...(parsedId.status === "invalid" ? { schoolIdIssue: `Roster row ${index + 2}, column E: ${parsedId.reason}` } : {}),
+    };
+    if (schoolId && seenNumbers.has(schoolId)) {
+      const first = seenNumbers.get(schoolId);
+      const issue = `Roster rows ${first.row} and ${index + 2}, column E have a duplicate student number. Correct those roster rows before importing their tiers.`;
+      first.entry.schoolId = entry.schoolId = "";
+      first.entry.schoolIdIssue = entry.schoolIdIssue = issue;
+    } else if (schoolId) seenNumbers.set(schoolId, { row: index + 2, entry });
+    directory.push(entry);
   }
   return directory.sort((a, b) => a.email.localeCompare(b.email));
 }

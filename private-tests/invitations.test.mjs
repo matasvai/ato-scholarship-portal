@@ -75,6 +75,51 @@ test("invitation commits member and aliases before email; retries preserve tier 
   assert.equal(f.calls.creates, 1);
 });
 
+test("prepare creates one durable account without email and only explicit send crosses the mail boundary", async t => {
+  const f = await fixture(t);
+  const prepared = await f.run("prepare");
+  assert.equal(prepared.invitation.status, "ready");
+  assert.equal(prepared.invitation.canResend, true);
+  assert.equal(f.calls.sends, 0);
+  assert.equal((await f.run("prepare")).memberId, prepared.memberId);
+  assert.equal((await f.run("create")).memberId, prepared.memberId, "legacy create cannot accidentally email a saved account");
+  assert.equal((await f.run("reconcile")).memberId, prepared.memberId);
+  assert.equal(f.calls.creates, 1);
+  assert.equal(f.calls.sends, 0);
+  await f.run("resend");
+  assert.equal(f.calls.sends, 1);
+  await f.storage.prepare("UPDATE members SET active=0 WHERE id=?").run(prepared.memberId);
+  await assert.rejects(f.run("prepare"), error => error.status === 409);
+});
+
+test("prepare recovery after an interrupted provider response never sends email", async t => {
+  const f = await fixture(t), create = f.provider.create;
+  f.provider.create = async (email, proof) => { await create(email, proof); throw Error("lost response"); };
+  await assert.rejects(f.run("prepare"), error => error.status === 503);
+  const resumed = await f.run("prepare");
+  assert.equal(resumed.invitation.status, "ready");
+  assert.equal(f.calls.creates, 1);
+  assert.equal(f.calls.sends, 0);
+});
+
+test("reconciling an untracked member preserves its portal ID and editable badge", async t => {
+  const f = await fixture(t);
+  const memberId = randomUUID(), authId = randomUUID(), alias = "kh-abcdef1234";
+  await f.storage.prepare("INSERT INTO members(workspace,id,name,email,role,tier,credits,active) VALUES (?,?,?,?,?,?,?,1)")
+    .run("chapter", memberId, f.input.name, f.input.email, "member", 2, 15);
+  for (const [provider, subject] of [["supabase", authId], ["login", "1234"], ["login", alias]])
+    await f.storage.prepare("INSERT INTO identities VALUES (?,?,?,?)").run("chapter", provider, subject, memberId);
+  f.accounts.set(f.input.email, { id: authId, email: f.input.email, confirmed: true });
+
+  const result = await f.run("reconcile");
+  assert.equal(result.invitation.loginId, alias.toUpperCase());
+  assert.equal((await f.state()).invitations[f.input.email].badge, "1234");
+  assert.equal((await f.run("prepare")).invitation.loginId, alias.toUpperCase());
+  assert.deepEqual((await f.storage.prepare("SELECT subject FROM identities WHERE provider='login' ORDER BY subject").all()).map(row => row.subject), ["1234", alias]);
+  assert.equal(f.calls.creates, 0);
+  assert.equal(f.calls.sends, 0);
+});
+
 test("provider create timeout repairs the exact account without sending or duplicating it", async t => {
   const f = await fixture(t);
   const create = f.provider.create;
